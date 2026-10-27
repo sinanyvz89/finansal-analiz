@@ -211,8 +211,18 @@ function buildHTMLReport(title, tables, notes) {
 }
 
 /* ── File Reading ── */
-async function readFile(file) {
+async function readFile(file, onProgress) {
   const name = file.name.toLowerCase();
+
+  // PDF: metin konumlarindan tablo yeniden kurulur (okuyucu ihtiyac aninda yuklenir)
+  if (/\.pdf$/i.test(name) || file.type === "application/pdf") {
+    try {
+      const [{ readPdfMizan }, buf] = await Promise.all([import("./pdfLoader.js"), file.arrayBuffer()]);
+      return await readPdfMizan(buf, onProgress);
+    } catch (err) {
+      return { rows: null, error: "PDF okuyucu yuklenemedi" + (navigator.onLine === false ? " (ilk PDF icin internet baglantisi gerekir)." : ": " + err.message) };
+    }
+  }
 
   // Excel, ODS, XML spreadsheet files
   if (/\.(xlsx?|ods|xml)$/i.test(name)) {
@@ -779,6 +789,7 @@ export default function App() {
   const [sel, setSel] = useState(0);
   const [karsiList, setKarsiList] = useState([]);
   const [loading, setLoading] = useState(false);
+  const [loadMsg, setLoadMsg] = useState("");
   const [info, setInfo] = useState(null);
   const [detay, setDetay] = useState(true);
   const [vergiSMM, setVergiSMM] = useState("");
@@ -833,6 +844,13 @@ export default function App() {
     window.addEventListener("fa-installable", inst); window.addEventListener("appinstalled", installed);
     window.addEventListener("resize", rs);
     return () => { window.removeEventListener("online", on); window.removeEventListener("offline", off); window.removeEventListener("fa-installable", inst); window.removeEventListener("appinstalled", installed); window.removeEventListener("resize", rs); };
+  }, []);
+
+  // Ana ekrana eklenmis uygulamada PDF okuyucuyu arka planda indir (internetsiz PDF icin)
+  useEffect(() => {
+    if (!isStandalone || (typeof navigator !== "undefined" && navigator.onLine === false)) return;
+    const t = setTimeout(() => { import("./pdfLoader.js").then((m) => m.warmUp && m.warmUp()).catch(() => {}); }, 6000);
+    return () => clearTimeout(t);
   }, []);
 
   // Acilista: cihazda kayitli mizanlari ve ayarlari geri yukle
@@ -909,8 +927,8 @@ export default function App() {
   const onFile = useCallback(async (e) => {
     const files = Array.from(e.target.files || []); if (!files.length) return;
     setLoading(true); setInfo(null);
-    for (const file of files) { try { const result = await readFile(file); if (result.error) { setInfo({ ok: false, text: result.error }); continue; } if (!result.rows) { setInfo({ ok: false, text: "Dosya okunamadi." }); continue; } const { data, err } = parseMizan(result.rows, file.name); if (data) { setMizanlar((p) => [...p, data]); setInfo({ ok: true, text: file.name + ": " + data.rows.length + " hesap yuklendi." }); } else { setInfo({ ok: false, text: err }); } } catch (ex) { setInfo({ ok: false, text: ex.message }); } }
-    setLoading(false); if (fRef.current) fRef.current.value = "";
+    for (const file of files) { try { setLoadMsg(/\.pdf$/i.test(file.name) ? "PDF okunuyor..." : ""); const result = await readFile(file, (p, n) => setLoadMsg("PDF okunuyor: sayfa " + p + " / " + n)); if (result.error) { setInfo({ ok: false, text: file.name + ": " + result.error }); continue; } if (!result.rows) { setInfo({ ok: false, text: "Dosya okunamadi." }); continue; } const { data, err } = parseMizan(result.rows, file.name); if (data) { setMizanlar((p) => [...p, data]); setInfo({ ok: true, text: file.name + ": " + data.rows.length + " hesap yuklendi." + (result.info ? " (PDF, " + result.info.pages + " sayfa — tutarlari bir kez kontrol etmeniz onerilir)" : "") }); } else { setInfo({ ok: false, text: file.name + ": " + err }); } } catch (ex) { setInfo({ ok: false, text: ex.message }); } }
+    setLoading(false); setLoadMsg(""); if (fRef.current) fRef.current.value = "";
   }, []);
   const remove = (i) => { setMizanlar((p) => p.filter((_, j) => j !== i)); setSel(0); setKarsiList([]); };
 
@@ -1071,11 +1089,11 @@ export default function App() {
           </div>
           <div onClick={() => fRef.current && fRef.current.click()} style={{ border: "2px dashed var(--color-border-secondary)", borderRadius: 16, padding: "2.5rem 1.5rem", textAlign: "center", cursor: "pointer", background: "var(--color-background-secondary)", transition: "border-color 0.2s" }}>
             <div style={{ fontSize: 40, opacity: 0.2, lineHeight: 1, marginBottom: 8 }}>+</div>
-            <div style={{ fontSize: 15, fontWeight: 500, marginBottom: 4 }}>{loading ? "Yukleniyor..." : "Dosya secmek icin tiklayin"}</div>
-            <div style={{ fontSize: 13, color: "var(--color-text-secondary)", marginBottom: 8 }}>Excel (.xlsx .xls) / CSV (.csv) / ODS / XML / TXT</div>
+            <div style={{ fontSize: 15, fontWeight: 500, marginBottom: 4 }}>{loading ? (loadMsg || "Yukleniyor...") : "Dosya secmek icin tiklayin"}</div>
+            <div style={{ fontSize: 13, color: "var(--color-text-secondary)", marginBottom: 8 }}>Excel (.xlsx .xls) / PDF / CSV (.csv) / ODS / XML / TXT</div>
             <div style={{ fontSize: 11, color: "var(--color-text-tertiary)" }}>Birden fazla dosya secebilirsiniz — her biri ayri donem olarak yuklenir</div>
           </div>
-          <input ref={fRef} type="file" accept=".csv,.tsv,.txt,.xlsx,.xls,.ods,.xml" multiple onChange={onFile} style={{ display: "none" }} />
+          <input ref={fRef} type="file" accept=".csv,.tsv,.txt,.xlsx,.xls,.ods,.xml,.pdf,application/pdf" multiple onChange={onFile} style={{ display: "none" }} />
         </div>
 
         {/* Info Note */}
@@ -1083,6 +1101,7 @@ export default function App() {
           <b>Mizan dosyasi nasil olmali?</b> Muhasebe programinizdan (Logo, Mikro, Eta, Luca, Parasut, Netsis, Zirve vb.) mizan raporunu alistiginiz sekilde disari aktarin.
           Sistemimiz baslik satirini otomatik algilar — "Hesap Kodu", "Borc Bakiye", "Alacak Bakiye" sutunlarini bulur.
           Dosya adini donem bilgisi iceren sekilde verin (orn: "Ocak_2025_Mizan.xlsx") — sistem donemi buradan algilar.
+          <br /><b>PDF mizan</b> da yukleyebilirsiniz: programin olusturdugu PDF'ler okunur. Taranmis (fotokopi/resim) PDF'lerde metin olmadigi icin okunamaz; mumkunse Excel veya CSV tercih edin.
         </div>
 
         {/* Upload Result */}
