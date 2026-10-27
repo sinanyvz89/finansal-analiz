@@ -1,6 +1,7 @@
 import { useState, useCallback, useMemo, useRef, useEffect, useLayoutEffect } from "react";
 import Papa from "papaparse";
 import * as XLSX from "xlsx";
+import { SYSTEM_PROMPT, buildAiData, ODAKLAR, ilkMesaj, sunucuDurumu, yorumIste } from "./aiYorum.js";
 
 /* ── Utilities ── */
 function parseNum(v) {
@@ -168,6 +169,14 @@ function applyMobileLayout(root, mobile) {
 const FA_MOBILE_CSS = `
 .fa-app { -webkit-tap-highlight-color: transparent; }
 .fa-app button { touch-action: manipulation; }
+.fa-md { font-size: 14px; line-height: 1.7; color: var(--color-text-primary); overflow-wrap: anywhere; }
+.fa-md h2, .fa-md h3 { font-size: 15.5px; font-weight: 650; margin: 16px 0 6px; color: var(--color-text-info); }
+.fa-md h4, .fa-md h5 { font-size: 14px; font-weight: 600; margin: 12px 0 4px; }
+.fa-md > :first-child, .fa-md > div > :first-child { margin-top: 0; }
+.fa-md p { margin: 0 0 8px; }
+.fa-md ul, .fa-md ol { margin: 0 0 8px; padding-left: 22px; }
+.fa-md li { margin: 3px 0; }
+.fa-md b { font-weight: 650; }
 .fa-hscroll { overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none; }
 .fa-hscroll::-webkit-scrollbar { display: none; }
 @media (max-width: ${MOBILE_BP}px) {
@@ -186,6 +195,25 @@ const FA_MOBILE_CSS = `
   .fa-app .fa-content svg { max-width: 100%; height: auto; }
 }
 `;
+
+/* ── HTML kacis + basit Markdown -> HTML (yapay zeka yorumu icin) ── */
+function escH(t) { return String(t == null ? "" : t).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
+function mdInline(t) { return escH(t).replace(/\*\*(.+?)\*\*/g, "<b>$1</b>").replace(/(^|[^*])\*(?!\s)(.+?)\*/g, "$1<i>$2</i>"); }
+function mdToHtml(md) {
+  const out = []; let list = null;
+  const close = () => { if (list) { out.push("</" + list + ">"); list = null; } };
+  for (const raw of String(md || "").split(/\r?\n/)) {
+    const l = raw.trimEnd();
+    let m;
+    if (!l.trim()) { close(); continue; }
+    if ((m = l.match(/^(#{1,4})\s+(.*)$/))) { close(); const lv = Math.min(4, m[1].length + 1); out.push("<h" + lv + ">" + mdInline(m[2]) + "</h" + lv + ">"); continue; }
+    if ((m = l.match(/^\s*[-*•]\s+(.*)$/))) { if (list !== "ul") { close(); out.push("<ul>"); list = "ul"; } out.push("<li>" + mdInline(m[1]) + "</li>"); continue; }
+    if ((m = l.match(/^\s*\d+[.)]\s+(.*)$/))) { if (list !== "ol") { close(); out.push("<ol>"); list = "ol"; } out.push("<li>" + mdInline(m[1]) + "</li>"); continue; }
+    close(); out.push("<p>" + mdInline(l) + "</p>");
+  }
+  close();
+  return out.join("");
+}
 
 /* ── CSV Builder ── */
 function buildCSV(rows2d) {
@@ -255,6 +283,51 @@ async function readFile(file, onProgress) {
   });
 }
 
+/* ── Donem (tarih araligi) tespiti ──
+   Gun bazli oranlar (alacak tahsil, stok devir) donemin gun sayisiyla hesaplanir.
+   Oncelik: mizan basligindaki Baslangic/Bitis tarihleri > dosya adindaki ay adi > 365 gun varsayimi. */
+const AYLAR = ["ocak", "subat", "mart", "nisan", "mayis", "haziran", "temmuz", "agustos", "eylul", "ekim", "kasim", "aralik"];
+function trNorm(s) {
+  return String(s || "").replace(/İ/g, "i").replace(/I/g, "ı").toLowerCase()
+    .replace(/ç/g, "c").replace(/ğ/g, "g").replace(/ı/g, "i").replace(/ö/g, "o").replace(/ş/g, "s").replace(/ü/g, "u");
+}
+const DATE_RE = /(\d{1,2})[./-](\d{1,2})[./-](\d{4})/g;
+function toDate(d, m, y) { const t = new Date(Date.UTC(+y, +m - 1, +d)); return isNaN(t) || t.getUTCDate() !== +d ? null : t; }
+function isoD(d) { return d ? d.toISOString().slice(0, 10) : null; }
+function fmtD(iso) { if (!iso) return ""; const [y, m, d] = iso.split("-"); return d + "." + m + "." + y; }
+function detectPeriod(headRows, fileName) {
+  let bas = null, son = null;
+  for (const r of headRows || []) {
+    const line = (Array.isArray(r) ? r : [r]).map((c) => String(c == null ? "" : c)).join(" ");
+    const dates = [...line.matchAll(DATE_RE)].map((m) => toDate(m[1], m[2], m[3])).filter(Boolean);
+    if (!dates.length) continue;
+    const n = trNorm(line);
+    if (/bitis|son tarih/.test(n)) son = dates[dates.length - 1];
+    else if (/baslangic|baslama|ilk tarih/.test(n)) bas = dates[0];
+    else if (dates.length >= 2 && !son) { bas = bas || dates[0]; son = dates[dates.length - 1]; }
+  }
+  if (son) {
+    if (!bas || bas > son) bas = new Date(Date.UTC(son.getUTCFullYear(), 0, 1));
+    return { bas: isoD(bas), son: isoD(son), gun: Math.round((son - bas) / 864e5) + 1, kaynak: "mizan tarihleri" };
+  }
+  const n = trNorm(fileName);
+  const yil = +((n.match(/(?:^|\D)(20\d{2})(?:\D|$)/) || [])[1] || new Date().getFullYear());
+  let ay = AYLAR.findIndex((a) => n.includes(a));
+  if (ay < 0) { const m = n.match(/(?:^|\D)(0?[1-9]|1[0-2])[._\- ]20\d{2}(?:\D|$)|(?:^|\D)20\d{2}[._\- ](0?[1-9]|1[0-2])(?:\D|$)/); if (m) ay = +(m[1] || m[2]) - 1; }
+  if (ay >= 0) {
+    const b = new Date(Date.UTC(yil, 0, 1)), e = new Date(Date.UTC(yil, ay + 1, 0));
+    return { bas: isoD(b), son: isoD(e), gun: Math.round((e - b) / 864e5) + 1, kaynak: "dosya adi" };
+  }
+  if (/yillik|yil sonu|kapanis|12 ay/.test(n)) return { bas: yil + "-01-01", son: yil + "-12-31", gun: 365, kaynak: "dosya adi" };
+  return null;
+}
+function donemBilgi(m) {
+  if (!m) return { gun: 365, kaynak: "varsayim" };
+  if (m.donemGun) return { gun: m.donemGun, bas: m.donemBas, son: m.donemSon, kaynak: m.donemKaynak };
+  const p = detectPeriod(null, m.fileName || m.donem || "");
+  return p || { gun: 365, kaynak: "varsayim" };
+}
+
 /* ── Mizan Parser ── */
 function parseMizan(allRows, fileName) {
   if (!allRows || allRows.length < 5) return { data: null, err: "Dosya bos." };
@@ -290,7 +363,8 @@ function parseMizan(allRows, fileName) {
     items.push({ kod, ad: String(c[adI] || "").trim(), borc, alacak, bBak, aBak });
   }
   if (!items.length) return { data: null, err: "Hesap verisi bulunamadi." };
-  return { data: { fileName, rows: items, donem: fileName.replace(/\.[^.]+$/, "") }, err: null };
+  const per = detectPeriod(allRows.slice(0, hi), fileName);
+  return { data: { fileName, rows: items, donem: fileName.replace(/\.[^.]+$/, ""), donemBas: per ? per.bas : null, donemSon: per ? per.son : null, donemGun: per ? per.gun : null, donemKaynak: per ? per.kaynak : null }, err: null };
 }
 
 /* ── Accounting ── */
@@ -361,13 +435,57 @@ function calcBil(m, dk) {
   const kvyk = gp("3"), uvyk = gp("4"), ozk = gp("5") + (dk || 0), pasif = kvyk + uvyk + ozk;
   return { donen, duran, aktif, kvyk, uvyk, ozk, pasif, nakit: sa("10"), tAlacak: sa("12"), stok: sa("15"), tBorc: sp("32") };
 }
-function calcAnaliz(g, b) {
+function calcAnaliz(g, b, gun) {
   if (!g || !b) return null;
-  return { co: b.kvyk ? b.donen / b.kvyk : 0, at: b.kvyk ? (b.donen - b.stok) / b.kvyk : 0, no: b.kvyk ? b.nakit / b.kvyk : 0, bo: b.ozk ? (b.kvyk + b.uvyk) / b.ozk : 0, bkm: g.netSatis ? g.brutKar / g.netSatis * 100 : 0, nkm: g.netSatis ? g.donemKari / g.netSatis * 100 : 0, fkm: g.netSatis ? g.faalKar / g.netSatis * 100 : 0, roe: b.ozk ? g.donemKari / b.ozk * 100 : 0, roa: b.aktif ? g.donemKari / b.aktif * 100 : 0, ag: b.tAlacak && g.netSatis ? 365 / (g.netSatis / b.tAlacak) : 0, sg: b.stok && g.satisMal ? 365 / (g.satisMal / b.stok) : 0 };
+  const G = gun || 365; // donemin gun sayisi (kumulatif mizan: yil basindan donem sonuna)
+  return { co: b.kvyk ? b.donen / b.kvyk : 0, at: b.kvyk ? (b.donen - b.stok) / b.kvyk : 0, no: b.kvyk ? b.nakit / b.kvyk : 0, bo: b.ozk ? (b.kvyk + b.uvyk) / b.ozk : 0, bkm: g.netSatis ? g.brutKar / g.netSatis * 100 : 0, nkm: g.netSatis ? g.donemKari / g.netSatis * 100 : 0, fkm: g.netSatis ? g.faalKar / g.netSatis * 100 : 0, roe: b.ozk ? g.donemKari / b.ozk * 100 : 0, roa: b.aktif ? g.donemKari / b.aktif * 100 : 0, ag: b.tAlacak && g.netSatis ? b.tAlacak / g.netSatis * G : 0, sg: b.stok && g.satisMal ? b.stok / g.satisMal * G : 0, gun: G };
 }
 function calcDikey(b, g) { if (!b || !g) return null; return { b: { dvY: pct(b.donen, b.aktif), durY: pct(b.duran, b.aktif), kvY: pct(b.kvyk, b.pasif), uvY: pct(b.uvyk, b.pasif), ozY: pct(b.ozk, b.pasif) }, g: { malY: pct(g.satisMal, g.netSatis), bkY: pct(g.brutKar, g.netSatis), fgY: pct(g.faalGid, g.netSatis), fkY: pct(g.faalKar, g.netSatis), nkY: pct(g.donemKari, g.netSatis) } }; }
-function genRapor(aa) {
-  if (!aa || !aa.length) return null; const s = aa[aa.length - 1]; if (!s) return null;
+/* ── Veri kontrolleri ──
+   Mizandaki kayit eksiklerini ve tutarsizliklari yakalar; bunlar oranlari yaniltabilir.
+   seviye: "kotu" (hata), "orta" (dikkat), "bilgi" */
+function veriKontrol(m, g, b) {
+  if (!m || !g || !b) return [];
+  const r = m.rows, out = [];
+  const fN = (n) => formatN(n);
+  const main = r.filter((x) => /^\d{3}$/.test(x.kod));
+  const net3 = (k) => { const e = main.find((x) => x.kod === k); return e ? e.bBak - e.aBak : null; };
+  // 1) Mizan denkligi
+  if (main.length) {
+    const tb = main.reduce((t, x) => t + x.bBak, 0), ta = main.reduce((t, x) => t + x.aBak, 0);
+    if (Math.abs(tb - ta) > Math.max(1, Math.abs(tb) * 1e-6)) out.push({ seviye: "kotu", baslik: "Mizan denk degil", aciklama: "Borc bakiyeleri toplami " + fN(tb) + ", alacak bakiyeleri toplami " + fN(ta) + " (fark " + fN(tb - ta) + "). Eksik veya hatali satir olabilir; tum tablolar etkilenir." });
+  }
+  // 2) Acilis kaydi / ozkaynak
+  const ozkHes = main.filter((x) => x.kod[0] === "5");
+  const ozk5 = ozkHes.reduce((t, x) => t + x.aBak - x.bBak, 0);
+  if (b.aktif > 0 && (!ozkHes.length || Math.abs(ozk5) < 1)) out.push({ seviye: "kotu", baslik: "Ozkaynak hesaplari (5) bos", aciklama: "Sermaye ve gecmis yil karlari gorunmuyor; acilis kaydi yapilmamis olabilir. Bilanco, Borc/Ozkaynak ve ROE bu donem icin yaniltici (ozkaynak sadece donem karindan olusuyor)." });
+  if (b.duran < -1) out.push({ seviye: "kotu", baslik: "Duran varliklar eksi bakiyede", aciklama: "Duran varliklar toplami " + fN(b.duran) + ". Varliklarin acilis bakiyesi girilmeden amortisman kaydi yapilmis gorunuyor." });
+  if (b.donen < -1) out.push({ seviye: "kotu", baslik: "Donen varliklar eksi bakiyede", aciklama: "Donen varliklar toplami " + fN(b.donen) + "." });
+  // 3) Ters bakiyeler
+  const kasa = net3("100");
+  if (kasa != null && kasa < -1) out.push({ seviye: "kotu", baslik: "Kasa alacak bakiyesi veriyor", aciklama: "100 Kasa " + fN(kasa) + ". Kasa eksi bakiye veremez; kayit hatasi veya kayit disi odeme isareti olarak degerlendirilir (VUK incelemelerinde risk)." });
+  const banka = net3("102");
+  if (banka != null && banka < -1) out.push({ seviye: "orta", baslik: "Banka hesabi alacak bakiyesi veriyor", aciklama: "102 Bankalar " + fN(banka) + ". Kredili mevduat kullaniliyorsa 300 Banka Kredileri hesabinda izlenmeli." });
+  for (const k of ["150", "151", "152", "153"]) { const v = net3(k); if (v != null && v < -1) out.push({ seviye: "kotu", baslik: k + " stok hesabi alacak bakiyesi veriyor", aciklama: k + " bakiyesi " + fN(v) + ". Stok eksiye dusemez; giris kaydi eksik veya cikis fazla yapilmis." }); }
+  // 4) Satilan mal maliyeti
+  const smm62 = r.filter((x) => /^62\d$/.test(x.kod)).reduce((t, x) => t + x.bBak - x.aBak, 0);
+  const y7 = ["710", "720", "730"].map((k) => [k, net3(k) || 0]).filter(([, v]) => Math.abs(v) > 1);
+  if (g.netSatis > 0 && Math.abs(smm62) < 1) {
+    const ek = y7.length ? " 7/A maliyet hesaplarinda (" + y7.map(([k, v]) => k + ": " + fN(v)).join(", ") + ") bakiye var; bunlar dogrudan maliyet sayildi." : "";
+    out.push({ seviye: "orta", baslik: "Satilan mal maliyeti (620/621) kaydi yok", aciklama: "Satis var ama 62x hesaplari bos." + ek + " Donem sonu maliyet ve stok cikis kayitlari yapilmadiysa brut kar marji (%" + (g.netSatis ? (g.brutKar / g.netSatis * 100).toFixed(1) : "0") + ") ve stok devir suresi gercegi yansitmaz." });
+  }
+  // 5) Bilanco denkligi
+  if (Math.abs(b.aktif - b.pasif) > Math.max(1, Math.abs(b.aktif) * 1e-6)) out.push({ seviye: "kotu", baslik: "Bilanco denk degil", aciklama: "Aktif " + fN(b.aktif) + ", pasif " + fN(b.pasif) + " (fark " + fN(b.aktif - b.pasif) + ")." });
+  // 6) Donem uzunlugu
+  const d = donemBilgi(m);
+  if (d.kaynak === "varsayim") out.push({ seviye: "orta", baslik: "Donem uzunlugu belirlenemedi", aciklama: "Alacak tahsil ve stok devir sureleri 365 gun varsayilarak hesaplandi. Dosya adina ay yazin (orn. Mart_2025_Mizan) veya mizani baslangic/bitis tarihleriyle alin." });
+  else if (d.gun < 360) out.push({ seviye: "bilgi", baslik: "Donemlik veriler (" + d.gun + " gun)", aciklama: (d.bas ? fmtD(d.bas) + " - " + fmtD(d.son) + ", " : "") + "kaynak: " + d.kaynak + ". Tahsil/stok sureleri bu gun sayisiyla hesaplandi. Karlilik ve ROE/ROA donemliktir; yillik hedeflerle dogrudan karsilastirilmamali." });
+  return out;
+}
+
+function genRapor(s) {
+  // Not: eskiden son yuklenen donemi kullaniyordu; artik secili ana donemin analizi verilir
+  if (!s) return null;
   const ar = [], ek = [], on = [];
   if (s.co >= 1.5) ar.push("Cari oran guclu (" + s.co.toFixed(2) + ")"); else if (s.co >= 1) ar.push("Cari oran kabul edilebilir (" + s.co.toFixed(2) + ")"); else { ek.push("Cari oran dusuk (" + s.co.toFixed(2) + ")"); on.push("KVYK yapilandirmasi yapilmali"); }
   if (s.bkm >= 30) ar.push("Brut kar marji yuksek (%" + s.bkm.toFixed(1) + ")"); else if (s.bkm >= 15) ar.push("Brut kar marji makul (%" + s.bkm.toFixed(1) + ")"); else { ek.push("Brut kar marji dusuk (%" + s.bkm.toFixed(1) + ")"); on.push("Satis maliyetleri optimize edilmeli"); }
@@ -546,7 +664,7 @@ function exportDashboardHTML(g, b, a, rapor, d1) {
   downloadHTML(buildHTMLReport("Dashboard - " + d1, t, n), "Dashboard_" + d1.replace(/\s/g, "_") + ".html");
 }
 
-function exportFullHTML(g, gK, b, bK, a, rapor, d1, d2) {
+function exportFullHTML(g, gK, b, bK, a, rapor, d1, d2, kontrol, aiYorum) {
   const fn = (n) => formatN(n);
   const hasK = gK != null;
   let t = '<h2>Gelir Tablosu</h2><table><tr><th>Hesap</th><th class="r">' + d1 + '</th>';
@@ -573,6 +691,8 @@ function exportFullHTML(g, gK, b, bK, a, rapor, d1, d2) {
   t += '</table>';
   let n = '<h2>Degerlendirme</h2>';
   if (rapor) { for (const r of rapor.ar) n += '<div class="note ng">+ ' + r + '</div>'; for (const r of rapor.ek) n += '<div class="note nr">! ' + r + '</div>'; n += '<h3>Oneriler</h3>'; for (const r of rapor.on) n += '<div class="note ny">> ' + r + '</div>'; }
+  if (kontrol && kontrol.length) { n += '<h2>Veri Kontrolleri</h2>'; for (const k of kontrol) n += '<div class="note ' + (k.seviye === "kotu" ? "nr" : k.seviye === "orta" ? "ny" : "ng") + '"><b>' + escH(k.baslik) + '</b><br>' + escH(k.aciklama) + '</div>'; }
+  if (aiYorum) n += '<h2>Yapay Zeka Yorumu</h2><div style="font-size:12px;line-height:1.7;">' + mdToHtml(aiYorum) + '</div><p style="color:#999;font-size:9px;">Yapay zeka tarafindan uretilmistir; karar oncesi uzman kontrolu onerilir.</p>';
   downloadHTML(buildHTMLReport("Finansal Rapor - " + d1, t, n), "Tam_Rapor_" + d1.replace(/\s/g, "_") + ".html");
 }
 
@@ -581,7 +701,10 @@ const SEC = { fontSize: 16, fontWeight: 500, color: "var(--color-text-primary)",
 const CARD = { background: "var(--color-background-secondary)", borderRadius: "var(--border-radius-md)", padding: "1rem" };
 const DL_STYLE = { padding: "7px 14px", fontSize: 12, fontWeight: 500, cursor: "pointer", background: "var(--color-background-info)", color: "var(--color-text-info)", border: "0.5px solid var(--color-border-info)", borderRadius: "var(--border-radius-md)" };
 
-function Badge({ val }) { if (val == null || isNaN(val)) return null; return (<span style={{ fontSize: 11, padding: "2px 8px", borderRadius: 99, background: val >= 0 ? "#E1F5EE" : "#FCEBEB", color: val >= 0 ? "#0F6E56" : "#A32D2D", fontWeight: 500, whiteSpace: "nowrap" }}>{val >= 0 ? "+" : ""}{val.toFixed(1)}%</span>); }
+const HEX_OF = { "var(--color-background-success)": "#E1F5EE", "var(--color-background-warning)": "#FAEEDA", "var(--color-background-danger)": "#FCEBEB", "var(--color-background-info)": "#E6F1FB", "var(--color-text-success)": "#0F6E56", "var(--color-text-warning)": "#BA7517", "var(--color-text-danger)": "#A32D2D", "var(--color-text-info)": "#185FA5" };
+// Disa aktarilan HTML raporlarda tema degiskeni olmadigi icin sabit renge cevir
+const hexOf = (c) => HEX_OF[c] || c;
+function Badge({ val }) { if (val == null || isNaN(val)) return null; return (<span style={{ fontSize: 11, padding: "2px 8px", borderRadius: 99, background: val >= 0 ? "var(--color-background-success)" : "var(--color-background-danger)", color: val >= 0 ? "var(--color-text-success)" : "var(--color-text-danger)", fontWeight: 500, whiteSpace: "nowrap" }}>{val >= 0 ? "+" : ""}{val.toFixed(1)}%</span>); }
 function CHeader({ d1, d2, extras }) {
   // extras = [{donem: "...", ...}] for multi-period
   const allD = extras && extras.length > 0 ? [d1, ...extras.map((e) => e)] : (d2 ? [d1, d2] : [d1]);
@@ -604,6 +727,23 @@ function SubCRows({ subs, type, top5Map, gK, subsKField, extraGelirler }) {
   const subsK = gK && gK[subsKField] ? gK[subsKField] : [];
   const extraSubsList = (extraGelirler || []).map((eg) => eg && eg[subsKField] ? eg[subsKField] : []);
   return (<>{subs.map((s) => { const val = type === "alacak" ? (s.aBak - s.bBak) : (s.bBak - s.aBak); if (val === 0) return null; const matchK = subsK.find((sk) => sk.kod === s.kod); const valK = matchK ? (type === "alacak" ? (matchK.aBak - matchK.bBak) : (matchK.bBak - matchK.aBak)) : null; const extraV = extraSubsList.map((esubs) => { const m = esubs.find((sk) => sk.kod === s.kod); return m ? (type === "alacak" ? (m.aBak - m.bBak) : (m.bBak - m.aBak)) : 0; }); const top5 = (top5Map && top5Map[s.kod]) ? top5Map[s.kod] : []; const top5K = (gK && gK.top5Map && gK.top5Map[s.kod]) ? gK.top5Map[s.kod] : []; return (<div key={s.kod}><CRow label={s.kod + " " + s.ad} v1={val} v2={extraV.length > 0 ? null : valK} sub extraVals={extraV.length > 0 ? extraV : undefined} />{top5.map((t) => { const tK = top5K.find((tk) => tk.kod === t.kod); return <CRow key={t.kod} label={t.kod + " " + t.ad} v1={t.val} v2={extraV.length > 0 ? null : (tK ? tK.val : null)} leaf />; })}</div>); })}</>);
+}
+function KontrolKutusu({ items }) {
+  if (!items || !items.length) return null;
+  const T = { kotu: ["var(--color-background-danger)", "var(--color-text-danger)", "!"], orta: ["var(--color-background-warning)", "var(--color-text-warning)", "~"], bilgi: ["var(--color-background-info)", "var(--color-text-info)", "i"] };
+  const sira = { kotu: 0, orta: 1, bilgi: 2 };
+  const list = [...items].sort((a, b) => sira[a.seviye] - sira[b.seviye]);
+  return (<div style={{ marginBottom: "1.5rem" }}>
+    <div style={{ fontSize: 15, fontWeight: 500, marginBottom: 2 }}>Veri kontrolleri</div>
+    <div style={{ fontSize: 12, color: "var(--color-text-tertiary)", marginBottom: 10 }}>Mizandaki eksik veya tutarsiz kayitlar oranlari yaniltabilir; yorumlamadan once bunlara bakin.</div>
+    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+      {list.map((k, i) => { const [bg, fg, ic] = T[k.seviye] || T.bilgi; return (
+        <div key={i} style={{ padding: "11px 16px", borderRadius: 10, background: bg, borderLeft: "3px solid " + fg }}>
+          <div style={{ fontSize: 13, fontWeight: 600, color: fg, display: "flex", gap: 8 }}><span style={{ flexShrink: 0 }}>{ic}</span><span>{k.baslik}</span></div>
+          <div style={{ fontSize: 12.5, lineHeight: 1.6, color: "var(--color-text-primary)", marginTop: 3, paddingLeft: 16 }}>{k.aciklama}</div>
+        </div>); })}
+    </div>
+  </div>);
 }
 function OranCard({ ad, deger, ac, renk }) { return (<div style={{ background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-lg)", padding: "1rem 1.25rem" }}><div style={{ fontSize: 12, color: "var(--color-text-secondary)", marginBottom: 6 }}>{ad}</div><div style={{ fontSize: 22, fontWeight: 500, color: renk }}>{deger}</div>{ac && <div style={{ fontSize: 12, color: "var(--color-text-tertiary)", marginTop: 4 }}>{ac}</div>}</div>); }
 
@@ -767,11 +907,11 @@ const SEKTORLER = {
   },
 };
 
-const TABS = ["Mizan Yukle", "Gelir Tablosu", "Bilanco", "Nakit Akis", "Analizler", "Dashboard", "Rapor", "Vergi", "Sektor", "Gider Analizi", "Gelir Vergisi", "KDV"];
+const TABS = ["Mizan Yukle", "Gelir Tablosu", "Bilanco", "Nakit Akis", "Analizler", "Dashboard", "Rapor", "Vergi", "Sektor", "Gider Analizi", "Gelir Vergisi", "KDV", "AI Yorum"];
 const TAB_GROUPS = [
   { grp: "Veri", tabs: [0] },
   { grp: "Tablolar", tabs: [1, 2, 3] },
-  { grp: "Analiz", tabs: [4, 5, 6] },
+  { grp: "Analiz", tabs: [4, 5, 6, 12] },
   { grp: "Vergi", tabs: [7, 10, 11] },
   { grp: "Detay", tabs: [8, 9] },
 ];
@@ -934,9 +1074,10 @@ export default function App() {
 
   const gelirler = useMemo(() => mizanlar.map(calcGelir), [mizanlar]);
   const bilancolar = useMemo(() => mizanlar.map((m, i) => calcBil(m, gelirler[i] ? gelirler[i].donemKari : 0)), [mizanlar, gelirler]);
-  const analizler = useMemo(() => mizanlar.map((_, i) => calcAnaliz(gelirler[i], bilancolar[i])), [gelirler, bilancolar]);
+  const analizler = useMemo(() => mizanlar.map((m, i) => calcAnaliz(gelirler[i], bilancolar[i], donemBilgi(m).gun)), [mizanlar, gelirler, bilancolar]);
+  const kontroller = useMemo(() => mizanlar.map((m, i) => veriKontrol(m, gelirler[i], bilancolar[i])), [mizanlar, gelirler, bilancolar]);
   const dikeyler = useMemo(() => mizanlar.map((_, i) => calcDikey(bilancolar[i], gelirler[i])), [bilancolar, gelirler]);
-  const rapor = useMemo(() => genRapor(analizler), [analizler]);
+  const rapor = useMemo(() => genRapor(analizler[sel]), [analizler, sel]);
 
   const g = gelirler[sel], b = bilancolar[sel], a = analizler[sel], d = dikeyler[sel];
   const gK = karsi >= 0 ? gelirler[karsi] : null, bK = karsi >= 0 ? bilancolar[karsi] : null;
@@ -952,11 +1093,66 @@ export default function App() {
   const multiGelirVal = (field) => extraGelirler.map((eg) => eg ? eg[field] : 0);
   const multiBilVal = (field) => extraBilancolar.map((eb) => eb ? eb[field] : 0);
 
-  const renk = (v, iyi, orta) => v >= iyi ? "#0F6E56" : v >= (orta != null ? orta : iyi) ? "#BA7517" : "#A32D2D";
+  const renk = (v, iyi, orta) => v >= iyi ? "var(--color-text-success)" : v >= (orta != null ? orta : iyi) ? "var(--color-text-warning)" : "var(--color-text-danger)";
+
+  /* ── Yapay zeka yorumu ── */
+  const [aiDurum, setAiDurum] = useState(null); // { durum, kodGerekli }
+  const [aiOdak, setAiOdak] = useState("genel");
+  const [aiKod, setAiKod] = useState(() => { try { return localStorage.getItem("fa-ai-kod") || ""; } catch (e) { return ""; } });
+  const [aiSoru, setAiSoru] = useState("");
+  const [aiKayit, setAiKayit] = useState({}); // donem anahtari -> mesajlar
+  const [ai, setAi] = useState({ loading: false, text: "", error: null });
+  const aiAbort = useRef(null);
+  const aiTextRef = useRef("");
+  const aiKey = [sel, ...karsiList].map((i) => (mizanlar[i] ? mizanlar[i].donem : "")).join(" | ");
+  const aiMesajlar = aiKayit[aiKey] || [];
+  useEffect(() => { idbGet("ai").then((v) => { if (v && typeof v === "object") setAiKayit(v); }); }, []);
+  useEffect(() => { if (restored) idbSet("ai", aiKayit); }, [restored, aiKayit]);
+  useEffect(() => { if (tab === 12 && !aiDurum) sunucuDurumu().then(setAiDurum); }, [tab, aiDurum]);
+  const aiData = useMemo(() => {
+    if (tab !== 12 || !mizanlar[sel]) return "";
+    return buildAiData({ mizanlar, gelirler, bilancolar, analizler, kontroller, idx: [sel, ...karsiList], donemBilgi, sektor: SEKTORLER[sektor] });
+  }, [tab, mizanlar, gelirler, bilancolar, analizler, kontroller, sel, karsiList, sektor]);
+  const aiGonder = async (yeniMesajlar) => {
+    if (aiAbort.current) aiAbort.current.abort();
+    const ctrl = new AbortController(); aiAbort.current = ctrl;
+    const key = aiKey;
+    setAiKayit((p) => ({ ...p, [key]: yeniMesajlar }));
+    setAi({ loading: true, text: "", error: null });
+    aiTextRef.current = "";
+    try {
+      const metin = await yorumIste(yeniMesajlar, { kod: aiKod, signal: ctrl.signal, onChunk: (t) => { aiTextRef.current = t; setAi((p) => ({ ...p, text: t })); } });
+      setAiKayit((p) => ({ ...p, [key]: [...yeniMesajlar, { role: "assistant", content: metin || "(bos yanit)" }] }));
+      setAi({ loading: false, text: "", error: null });
+    } catch (e) {
+      if (e.name === "AbortError") {
+        const yarim = aiTextRef.current;
+        setAiKayit((q) => ({ ...q, [key]: yarim ? [...yeniMesajlar, { role: "assistant", content: yarim + "\n\n_(durduruldu)_" }] : yeniMesajlar.slice(0, -1) }));
+        setAi({ loading: false, text: "", error: null });
+        return;
+      }
+      setAiKayit((p) => ({ ...p, [key]: yeniMesajlar.slice(0, -1).length ? yeniMesajlar.slice(0, -1) : [] }));
+      setAi({ loading: false, text: "", error: e.message });
+      if (e.code === "BAD_CODE") setAiDurum((d) => ({ ...(d || {}), kodGerekli: true }));
+    } finally { if (aiAbort.current === ctrl) aiAbort.current = null; }
+  };
+  const aiBaslat = () => aiGonder([{ role: "user", content: ilkMesaj(aiData, aiOdak) }]);
+  const aiSor = () => { const q = aiSoru.trim(); if (!q || ai.loading) return; setAiSoru(""); aiGonder([...aiMesajlar, { role: "user", content: q }]); };
+  const aiDurdur = () => { if (aiAbort.current) aiAbort.current.abort(); };
+  const aiSon = [...aiMesajlar].reverse().find((m) => m.role === "assistant");
+  const aiClaudeda = () => {
+    const metin = SYSTEM_PROMPT + "\n\n" + ilkMesaj(aiData, aiOdak);
+    let ok = false;
+    try { if (navigator.clipboard && navigator.clipboard.writeText) { navigator.clipboard.writeText(metin).then(() => showToast("Veri kopyalandi — Claude'da yeni sohbete yapistirin")).catch(() => showToast("Kopyalanamadi; 'Metni indir' secenegini kullanin")); ok = true; } } catch (e) { /* yoksay */ }
+    if (!ok) showToast("Kopyalanamadi; 'Metni indir' secenegini kullanin");
+    window.open("https://claude.ai/new", "_blank", "noopener");
+  };
+  const aiMetniIndir = () => saveFile(new Blob([SYSTEM_PROMPT + "\n\n" + ilkMesaj(aiData, aiOdak)], { type: "text/plain;charset=utf-8" }), "FinAnaliz_AI_" + (d1 || "veri").replace(/\s/g, "_") + ".txt");
+  const aiKopyala = (t) => { try { navigator.clipboard.writeText(t).then(() => showToast("Yorum kopyalandi")); } catch (e) { /* yoksay */ } };
 
   const activeGroup = TAB_GROUPS.find((gr) => gr.tabs.includes(tab)) || TAB_GROUPS[0];
   const hasData = mizanlar.length > 0;
-  const showPeriods = mizanlar.length > 1 && tab > 0 && tab < 12;
+  const showPeriods = mizanlar.length > 1 && tab > 0 && tab < TABS.length;
   const periodControls = (
     <>
           <div style={{ display: "flex", gap: 16, flexWrap: "wrap", alignItems: "center", marginBottom: karsiList.length > 0 ? 10 : 0 }}>
@@ -1346,7 +1542,7 @@ export default function App() {
           const fark = hasK2 ? v1 - v2 : null;
           const dg = hasK2 ? degFn(v1, v2) : null;
           if (!hasK2) return (<div style={{ display: "grid", gridTemplateColumns: "minmax(0,2.5fr) minmax(0,1fr)", padding: sub ? "5px 12px" : "8px 12px", paddingLeft: sub ? 28 : 12, borderBottom: "0.5px solid var(--color-border-tertiary)", fontWeight: bold ? 500 : 400, fontSize: sub ? 13 : 14, color: sub ? "var(--color-text-secondary)" : "var(--color-text-primary)", background: hl ? "var(--color-background-secondary)" : "transparent" }}><span>{label}</span><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatN(v1)}</span></div>);
-          return (<div style={{ display: "grid", gridTemplateColumns: "minmax(0,2.2fr) minmax(0,1fr) minmax(0,1fr) minmax(0,1fr) minmax(0,0.7fr)", padding: sub ? "5px 12px" : "8px 12px", paddingLeft: sub ? 28 : 12, borderBottom: "0.5px solid var(--color-border-tertiary)", fontWeight: bold ? 500 : 400, fontSize: sub ? 13 : 14, color: sub ? "var(--color-text-secondary)" : "var(--color-text-primary)", background: hl ? "var(--color-background-secondary)" : "transparent", gap: 2 }}><span>{label}</span><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatN(v1)}</span><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatN(v2)}</span><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums", color: fark >= 0 ? "#0F6E56" : "#A32D2D" }}>{fark >= 0 ? "+" : ""}{formatN(fark)}</span><span style={{ textAlign: "right" }}><Badge val={dg} /></span></div>);
+          return (<div style={{ display: "grid", gridTemplateColumns: "minmax(0,2.2fr) minmax(0,1fr) minmax(0,1fr) minmax(0,1fr) minmax(0,0.7fr)", padding: sub ? "5px 12px" : "8px 12px", paddingLeft: sub ? 28 : 12, borderBottom: "0.5px solid var(--color-border-tertiary)", fontWeight: bold ? 500 : 400, fontSize: sub ? 13 : 14, color: sub ? "var(--color-text-secondary)" : "var(--color-text-primary)", background: hl ? "var(--color-background-secondary)" : "transparent", gap: 2 }}><span>{label}</span><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatN(v1)}</span><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatN(v2)}</span><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums", color: fark >= 0 ? "var(--color-text-success)" : "var(--color-text-danger)" }}>{fark >= 0 ? "+" : ""}{formatN(fark)}</span><span style={{ textAlign: "right" }}><Badge val={dg} /></span></div>);
         };
 
         const DistBar = ({ items: barItems, total, label }) => (
@@ -1384,9 +1580,9 @@ export default function App() {
             <div style={{ padding: "10px 14px", background: "var(--color-background-info)", color: "var(--color-text-info)", fontWeight: 500, fontSize: 14 }}>Aktif (Varliklar)</div>
             <CHeader d1={d1} d2={d2} />
             <BRow label="I. Donen Varliklar" v1={b.donen} v2={bK ? bK.donen : null} bold />
-            {dSubs.map((s) => (<div key={s.kod}><div onClick={() => s.children.length > 0 ? toggleBil(s.kod) : null} style={{ display: "grid", gridTemplateColumns: hasK ? "minmax(0,2.2fr) minmax(0,1fr) minmax(0,1fr) minmax(0,1fr) minmax(0,0.7fr)" : "minmax(0,2.5fr) minmax(0,1fr)", padding: "5px 12px", paddingLeft: 28, borderBottom: "0.5px solid var(--color-border-tertiary)", fontSize: 13, color: "var(--color-text-secondary)", cursor: s.children.length > 0 ? "pointer" : "default", background: expandedBil[s.kod] ? "rgba(133,183,235,0.06)" : "transparent" }}><span style={{ display: "flex", alignItems: "center", gap: 6 }}>{s.children.length > 0 && <span style={{ fontSize: 9, color: "var(--color-text-tertiary)", transition: "transform 0.2s", transform: expandedBil[s.kod] ? "rotate(90deg)" : "rotate(0deg)" }}>▶</span>}{s.kod} {s.ad}</span><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatN(s.val)}</span>{hasK && s.valK != null && <><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatN(s.valK)}</span><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums", color: s.val - s.valK >= 0 ? "#0F6E56" : "#A32D2D" }}>{s.val - s.valK >= 0 ? "+" : ""}{formatN(s.val - s.valK)}</span><span style={{ textAlign: "right" }}><Badge val={degFn(s.val, s.valK)} /></span></>}</div>{expandedBil[s.kod] && s.children.map((c) => (<div key={c.kod} style={{ display: "grid", gridTemplateColumns: hasK ? "minmax(0,2.2fr) minmax(0,1fr) minmax(0,1fr) minmax(0,1fr) minmax(0,0.7fr)" : "minmax(0,2.5fr) minmax(0,1fr)", padding: "3px 12px", paddingLeft: 48, borderBottom: "0.5px solid var(--color-border-tertiary)", fontSize: 12, color: "var(--color-text-tertiary)" }}><span>{c.kod} {c.ad}</span><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatN(c.val)}</span>{hasK && c.valK != null && <><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatN(c.valK)}</span><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums", color: c.val - c.valK >= 0 ? "#0F6E56" : "#A32D2D" }}>{c.val - c.valK >= 0 ? "+" : ""}{formatN(c.val - c.valK)}</span><span style={{ textAlign: "right" }}><Badge val={degFn(c.val, c.valK)} /></span></>}</div>))}</div>))}
+            {dSubs.map((s) => (<div key={s.kod}><div onClick={() => s.children.length > 0 ? toggleBil(s.kod) : null} style={{ display: "grid", gridTemplateColumns: hasK ? "minmax(0,2.2fr) minmax(0,1fr) minmax(0,1fr) minmax(0,1fr) minmax(0,0.7fr)" : "minmax(0,2.5fr) minmax(0,1fr)", padding: "5px 12px", paddingLeft: 28, borderBottom: "0.5px solid var(--color-border-tertiary)", fontSize: 13, color: "var(--color-text-secondary)", cursor: s.children.length > 0 ? "pointer" : "default", background: expandedBil[s.kod] ? "rgba(133,183,235,0.06)" : "transparent" }}><span style={{ display: "flex", alignItems: "center", gap: 6 }}>{s.children.length > 0 && <span style={{ fontSize: 9, color: "var(--color-text-tertiary)", transition: "transform 0.2s", transform: expandedBil[s.kod] ? "rotate(90deg)" : "rotate(0deg)" }}>▶</span>}{s.kod} {s.ad}</span><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatN(s.val)}</span>{hasK && s.valK != null && <><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatN(s.valK)}</span><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums", color: s.val - s.valK >= 0 ? "var(--color-text-success)" : "var(--color-text-danger)" }}>{s.val - s.valK >= 0 ? "+" : ""}{formatN(s.val - s.valK)}</span><span style={{ textAlign: "right" }}><Badge val={degFn(s.val, s.valK)} /></span></>}</div>{expandedBil[s.kod] && s.children.map((c) => (<div key={c.kod} style={{ display: "grid", gridTemplateColumns: hasK ? "minmax(0,2.2fr) minmax(0,1fr) minmax(0,1fr) minmax(0,1fr) minmax(0,0.7fr)" : "minmax(0,2.5fr) minmax(0,1fr)", padding: "3px 12px", paddingLeft: 48, borderBottom: "0.5px solid var(--color-border-tertiary)", fontSize: 12, color: "var(--color-text-tertiary)" }}><span>{c.kod} {c.ad}</span><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatN(c.val)}</span>{hasK && c.valK != null && <><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatN(c.valK)}</span><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums", color: c.val - c.valK >= 0 ? "var(--color-text-success)" : "var(--color-text-danger)" }}>{c.val - c.valK >= 0 ? "+" : ""}{formatN(c.val - c.valK)}</span><span style={{ textAlign: "right" }}><Badge val={degFn(c.val, c.valK)} /></span></>}</div>))}</div>))}
             <BRow label="II. Duran Varliklar" v1={b.duran} v2={bK ? bK.duran : null} bold />
-            {durSubs.map((s) => (<div key={s.kod}><div onClick={() => s.children.length > 0 ? toggleBil(s.kod) : null} style={{ display: "grid", gridTemplateColumns: hasK ? "minmax(0,2.2fr) minmax(0,1fr) minmax(0,1fr) minmax(0,1fr) minmax(0,0.7fr)" : "minmax(0,2.5fr) minmax(0,1fr)", padding: "5px 12px", paddingLeft: 28, borderBottom: "0.5px solid var(--color-border-tertiary)", fontSize: 13, color: "var(--color-text-secondary)", cursor: s.children.length > 0 ? "pointer" : "default", background: expandedBil[s.kod] ? "rgba(133,183,235,0.06)" : "transparent" }}><span style={{ display: "flex", alignItems: "center", gap: 6 }}>{s.children.length > 0 && <span style={{ fontSize: 9, color: "var(--color-text-tertiary)", transition: "transform 0.2s", transform: expandedBil[s.kod] ? "rotate(90deg)" : "rotate(0deg)" }}>▶</span>}{s.kod} {s.ad}</span><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatN(s.val)}</span>{hasK && s.valK != null && <><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatN(s.valK)}</span><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums", color: s.val - s.valK >= 0 ? "#0F6E56" : "#A32D2D" }}>{s.val - s.valK >= 0 ? "+" : ""}{formatN(s.val - s.valK)}</span><span style={{ textAlign: "right" }}><Badge val={degFn(s.val, s.valK)} /></span></>}</div>{expandedBil[s.kod] && s.children.map((c) => (<div key={c.kod} style={{ display: "grid", gridTemplateColumns: hasK ? "minmax(0,2.2fr) minmax(0,1fr) minmax(0,1fr) minmax(0,1fr) minmax(0,0.7fr)" : "minmax(0,2.5fr) minmax(0,1fr)", padding: "3px 12px", paddingLeft: 48, borderBottom: "0.5px solid var(--color-border-tertiary)", fontSize: 12, color: "var(--color-text-tertiary)" }}><span>{c.kod} {c.ad}</span><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatN(c.val)}</span>{hasK && c.valK != null && <><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatN(c.valK)}</span><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums", color: c.val - c.valK >= 0 ? "#0F6E56" : "#A32D2D" }}>{c.val - c.valK >= 0 ? "+" : ""}{formatN(c.val - c.valK)}</span><span style={{ textAlign: "right" }}><Badge val={degFn(c.val, c.valK)} /></span></>}</div>))}</div>))}
+            {durSubs.map((s) => (<div key={s.kod}><div onClick={() => s.children.length > 0 ? toggleBil(s.kod) : null} style={{ display: "grid", gridTemplateColumns: hasK ? "minmax(0,2.2fr) minmax(0,1fr) minmax(0,1fr) minmax(0,1fr) minmax(0,0.7fr)" : "minmax(0,2.5fr) minmax(0,1fr)", padding: "5px 12px", paddingLeft: 28, borderBottom: "0.5px solid var(--color-border-tertiary)", fontSize: 13, color: "var(--color-text-secondary)", cursor: s.children.length > 0 ? "pointer" : "default", background: expandedBil[s.kod] ? "rgba(133,183,235,0.06)" : "transparent" }}><span style={{ display: "flex", alignItems: "center", gap: 6 }}>{s.children.length > 0 && <span style={{ fontSize: 9, color: "var(--color-text-tertiary)", transition: "transform 0.2s", transform: expandedBil[s.kod] ? "rotate(90deg)" : "rotate(0deg)" }}>▶</span>}{s.kod} {s.ad}</span><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatN(s.val)}</span>{hasK && s.valK != null && <><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatN(s.valK)}</span><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums", color: s.val - s.valK >= 0 ? "var(--color-text-success)" : "var(--color-text-danger)" }}>{s.val - s.valK >= 0 ? "+" : ""}{formatN(s.val - s.valK)}</span><span style={{ textAlign: "right" }}><Badge val={degFn(s.val, s.valK)} /></span></>}</div>{expandedBil[s.kod] && s.children.map((c) => (<div key={c.kod} style={{ display: "grid", gridTemplateColumns: hasK ? "minmax(0,2.2fr) minmax(0,1fr) minmax(0,1fr) minmax(0,1fr) minmax(0,0.7fr)" : "minmax(0,2.5fr) minmax(0,1fr)", padding: "3px 12px", paddingLeft: 48, borderBottom: "0.5px solid var(--color-border-tertiary)", fontSize: 12, color: "var(--color-text-tertiary)" }}><span>{c.kod} {c.ad}</span><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatN(c.val)}</span>{hasK && c.valK != null && <><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatN(c.valK)}</span><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums", color: c.val - c.valK >= 0 ? "var(--color-text-success)" : "var(--color-text-danger)" }}>{c.val - c.valK >= 0 ? "+" : ""}{formatN(c.val - c.valK)}</span><span style={{ textAlign: "right" }}><Badge val={degFn(c.val, c.valK)} /></span></>}</div>))}</div>))}
             <BRow label="AKTIF TOPLAM" v1={b.aktif} v2={bK ? bK.aktif : null} bold hl />
           </div>
 
@@ -1395,11 +1591,11 @@ export default function App() {
             <div style={{ padding: "10px 14px", background: "var(--color-background-success)", color: "var(--color-text-success)", fontWeight: 500, fontSize: 14 }}>Pasif (Kaynaklar)</div>
             <CHeader d1={d1} d2={d2} />
             <BRow label="I. Kisa Vadeli Yabanci Kaynaklar" v1={b.kvyk} v2={bK ? bK.kvyk : null} bold />
-            {kvSubs.map((s) => (<div key={s.kod}><div onClick={() => s.children.length > 0 ? toggleBil(s.kod) : null} style={{ display: "grid", gridTemplateColumns: hasK ? "minmax(0,2.2fr) minmax(0,1fr) minmax(0,1fr) minmax(0,1fr) minmax(0,0.7fr)" : "minmax(0,2.5fr) minmax(0,1fr)", padding: "5px 12px", paddingLeft: 28, borderBottom: "0.5px solid var(--color-border-tertiary)", fontSize: 13, color: "var(--color-text-secondary)", cursor: s.children.length > 0 ? "pointer" : "default", background: expandedBil[s.kod] ? "rgba(133,183,235,0.06)" : "transparent" }}><span style={{ display: "flex", alignItems: "center", gap: 6 }}>{s.children.length > 0 && <span style={{ fontSize: 9, color: "var(--color-text-tertiary)", transition: "transform 0.2s", transform: expandedBil[s.kod] ? "rotate(90deg)" : "rotate(0deg)" }}>▶</span>}{s.kod} {s.ad}</span><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatN(s.val)}</span>{hasK && s.valK != null && <><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatN(s.valK)}</span><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums", color: s.val - s.valK >= 0 ? "#0F6E56" : "#A32D2D" }}>{s.val - s.valK >= 0 ? "+" : ""}{formatN(s.val - s.valK)}</span><span style={{ textAlign: "right" }}><Badge val={degFn(s.val, s.valK)} /></span></>}</div>{expandedBil[s.kod] && s.children.map((c) => (<div key={c.kod} style={{ display: "grid", gridTemplateColumns: hasK ? "minmax(0,2.2fr) minmax(0,1fr) minmax(0,1fr) minmax(0,1fr) minmax(0,0.7fr)" : "minmax(0,2.5fr) minmax(0,1fr)", padding: "3px 12px", paddingLeft: 48, borderBottom: "0.5px solid var(--color-border-tertiary)", fontSize: 12, color: "var(--color-text-tertiary)" }}><span>{c.kod} {c.ad}</span><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatN(c.val)}</span>{hasK && c.valK != null && <><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatN(c.valK)}</span><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums", color: c.val - c.valK >= 0 ? "#0F6E56" : "#A32D2D" }}>{c.val - c.valK >= 0 ? "+" : ""}{formatN(c.val - c.valK)}</span><span style={{ textAlign: "right" }}><Badge val={degFn(c.val, c.valK)} /></span></>}</div>))}</div>))}
+            {kvSubs.map((s) => (<div key={s.kod}><div onClick={() => s.children.length > 0 ? toggleBil(s.kod) : null} style={{ display: "grid", gridTemplateColumns: hasK ? "minmax(0,2.2fr) minmax(0,1fr) minmax(0,1fr) minmax(0,1fr) minmax(0,0.7fr)" : "minmax(0,2.5fr) minmax(0,1fr)", padding: "5px 12px", paddingLeft: 28, borderBottom: "0.5px solid var(--color-border-tertiary)", fontSize: 13, color: "var(--color-text-secondary)", cursor: s.children.length > 0 ? "pointer" : "default", background: expandedBil[s.kod] ? "rgba(133,183,235,0.06)" : "transparent" }}><span style={{ display: "flex", alignItems: "center", gap: 6 }}>{s.children.length > 0 && <span style={{ fontSize: 9, color: "var(--color-text-tertiary)", transition: "transform 0.2s", transform: expandedBil[s.kod] ? "rotate(90deg)" : "rotate(0deg)" }}>▶</span>}{s.kod} {s.ad}</span><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatN(s.val)}</span>{hasK && s.valK != null && <><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatN(s.valK)}</span><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums", color: s.val - s.valK >= 0 ? "var(--color-text-success)" : "var(--color-text-danger)" }}>{s.val - s.valK >= 0 ? "+" : ""}{formatN(s.val - s.valK)}</span><span style={{ textAlign: "right" }}><Badge val={degFn(s.val, s.valK)} /></span></>}</div>{expandedBil[s.kod] && s.children.map((c) => (<div key={c.kod} style={{ display: "grid", gridTemplateColumns: hasK ? "minmax(0,2.2fr) minmax(0,1fr) minmax(0,1fr) minmax(0,1fr) minmax(0,0.7fr)" : "minmax(0,2.5fr) minmax(0,1fr)", padding: "3px 12px", paddingLeft: 48, borderBottom: "0.5px solid var(--color-border-tertiary)", fontSize: 12, color: "var(--color-text-tertiary)" }}><span>{c.kod} {c.ad}</span><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatN(c.val)}</span>{hasK && c.valK != null && <><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatN(c.valK)}</span><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums", color: c.val - c.valK >= 0 ? "var(--color-text-success)" : "var(--color-text-danger)" }}>{c.val - c.valK >= 0 ? "+" : ""}{formatN(c.val - c.valK)}</span><span style={{ textAlign: "right" }}><Badge val={degFn(c.val, c.valK)} /></span></>}</div>))}</div>))}
             <BRow label="II. Uzun Vadeli Yabanci Kaynaklar" v1={b.uvyk} v2={bK ? bK.uvyk : null} bold />
-            {uvSubs.map((s) => (<div key={s.kod}><div onClick={() => s.children.length > 0 ? toggleBil(s.kod) : null} style={{ display: "grid", gridTemplateColumns: hasK ? "minmax(0,2.2fr) minmax(0,1fr) minmax(0,1fr) minmax(0,1fr) minmax(0,0.7fr)" : "minmax(0,2.5fr) minmax(0,1fr)", padding: "5px 12px", paddingLeft: 28, borderBottom: "0.5px solid var(--color-border-tertiary)", fontSize: 13, color: "var(--color-text-secondary)", cursor: s.children.length > 0 ? "pointer" : "default", background: expandedBil[s.kod] ? "rgba(133,183,235,0.06)" : "transparent" }}><span style={{ display: "flex", alignItems: "center", gap: 6 }}>{s.children.length > 0 && <span style={{ fontSize: 9, color: "var(--color-text-tertiary)", transition: "transform 0.2s", transform: expandedBil[s.kod] ? "rotate(90deg)" : "rotate(0deg)" }}>▶</span>}{s.kod} {s.ad}</span><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatN(s.val)}</span>{hasK && s.valK != null && <><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatN(s.valK)}</span><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums", color: s.val - s.valK >= 0 ? "#0F6E56" : "#A32D2D" }}>{s.val - s.valK >= 0 ? "+" : ""}{formatN(s.val - s.valK)}</span><span style={{ textAlign: "right" }}><Badge val={degFn(s.val, s.valK)} /></span></>}</div>{expandedBil[s.kod] && s.children.map((c) => (<div key={c.kod} style={{ display: "grid", gridTemplateColumns: hasK ? "minmax(0,2.2fr) minmax(0,1fr) minmax(0,1fr) minmax(0,1fr) minmax(0,0.7fr)" : "minmax(0,2.5fr) minmax(0,1fr)", padding: "3px 12px", paddingLeft: 48, borderBottom: "0.5px solid var(--color-border-tertiary)", fontSize: 12, color: "var(--color-text-tertiary)" }}><span>{c.kod} {c.ad}</span><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatN(c.val)}</span>{hasK && c.valK != null && <><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatN(c.valK)}</span><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums", color: c.val - c.valK >= 0 ? "#0F6E56" : "#A32D2D" }}>{c.val - c.valK >= 0 ? "+" : ""}{formatN(c.val - c.valK)}</span><span style={{ textAlign: "right" }}><Badge val={degFn(c.val, c.valK)} /></span></>}</div>))}</div>))}
+            {uvSubs.map((s) => (<div key={s.kod}><div onClick={() => s.children.length > 0 ? toggleBil(s.kod) : null} style={{ display: "grid", gridTemplateColumns: hasK ? "minmax(0,2.2fr) minmax(0,1fr) minmax(0,1fr) minmax(0,1fr) minmax(0,0.7fr)" : "minmax(0,2.5fr) minmax(0,1fr)", padding: "5px 12px", paddingLeft: 28, borderBottom: "0.5px solid var(--color-border-tertiary)", fontSize: 13, color: "var(--color-text-secondary)", cursor: s.children.length > 0 ? "pointer" : "default", background: expandedBil[s.kod] ? "rgba(133,183,235,0.06)" : "transparent" }}><span style={{ display: "flex", alignItems: "center", gap: 6 }}>{s.children.length > 0 && <span style={{ fontSize: 9, color: "var(--color-text-tertiary)", transition: "transform 0.2s", transform: expandedBil[s.kod] ? "rotate(90deg)" : "rotate(0deg)" }}>▶</span>}{s.kod} {s.ad}</span><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatN(s.val)}</span>{hasK && s.valK != null && <><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatN(s.valK)}</span><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums", color: s.val - s.valK >= 0 ? "var(--color-text-success)" : "var(--color-text-danger)" }}>{s.val - s.valK >= 0 ? "+" : ""}{formatN(s.val - s.valK)}</span><span style={{ textAlign: "right" }}><Badge val={degFn(s.val, s.valK)} /></span></>}</div>{expandedBil[s.kod] && s.children.map((c) => (<div key={c.kod} style={{ display: "grid", gridTemplateColumns: hasK ? "minmax(0,2.2fr) minmax(0,1fr) minmax(0,1fr) minmax(0,1fr) minmax(0,0.7fr)" : "minmax(0,2.5fr) minmax(0,1fr)", padding: "3px 12px", paddingLeft: 48, borderBottom: "0.5px solid var(--color-border-tertiary)", fontSize: 12, color: "var(--color-text-tertiary)" }}><span>{c.kod} {c.ad}</span><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatN(c.val)}</span>{hasK && c.valK != null && <><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatN(c.valK)}</span><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums", color: c.val - c.valK >= 0 ? "var(--color-text-success)" : "var(--color-text-danger)" }}>{c.val - c.valK >= 0 ? "+" : ""}{formatN(c.val - c.valK)}</span><span style={{ textAlign: "right" }}><Badge val={degFn(c.val, c.valK)} /></span></>}</div>))}</div>))}
             <BRow label="III. Ozkaynaklar" v1={b.ozk} v2={bK ? bK.ozk : null} bold />
-            {ozSubs.map((s) => (<div key={s.kod}><div onClick={() => s.children.length > 0 ? toggleBil(s.kod) : null} style={{ display: "grid", gridTemplateColumns: hasK ? "minmax(0,2.2fr) minmax(0,1fr) minmax(0,1fr) minmax(0,1fr) minmax(0,0.7fr)" : "minmax(0,2.5fr) minmax(0,1fr)", padding: "5px 12px", paddingLeft: 28, borderBottom: "0.5px solid var(--color-border-tertiary)", fontSize: 13, color: "var(--color-text-secondary)", cursor: s.children.length > 0 ? "pointer" : "default", background: expandedBil[s.kod] ? "rgba(133,183,235,0.06)" : "transparent" }}><span style={{ display: "flex", alignItems: "center", gap: 6 }}>{s.children.length > 0 && <span style={{ fontSize: 9, color: "var(--color-text-tertiary)", transition: "transform 0.2s", transform: expandedBil[s.kod] ? "rotate(90deg)" : "rotate(0deg)" }}>▶</span>}{s.kod} {s.ad}</span><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatN(s.val)}</span>{hasK && s.valK != null && <><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatN(s.valK)}</span><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums", color: s.val - s.valK >= 0 ? "#0F6E56" : "#A32D2D" }}>{s.val - s.valK >= 0 ? "+" : ""}{formatN(s.val - s.valK)}</span><span style={{ textAlign: "right" }}><Badge val={degFn(s.val, s.valK)} /></span></>}</div>{expandedBil[s.kod] && s.children.map((c) => (<div key={c.kod} style={{ display: "grid", gridTemplateColumns: hasK ? "minmax(0,2.2fr) minmax(0,1fr) minmax(0,1fr) minmax(0,1fr) minmax(0,0.7fr)" : "minmax(0,2.5fr) minmax(0,1fr)", padding: "3px 12px", paddingLeft: 48, borderBottom: "0.5px solid var(--color-border-tertiary)", fontSize: 12, color: "var(--color-text-tertiary)" }}><span>{c.kod} {c.ad}</span><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatN(c.val)}</span>{hasK && c.valK != null && <><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatN(c.valK)}</span><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums", color: c.val - c.valK >= 0 ? "#0F6E56" : "#A32D2D" }}>{c.val - c.valK >= 0 ? "+" : ""}{formatN(c.val - c.valK)}</span><span style={{ textAlign: "right" }}><Badge val={degFn(c.val, c.valK)} /></span></>}</div>))}</div>))}
+            {ozSubs.map((s) => (<div key={s.kod}><div onClick={() => s.children.length > 0 ? toggleBil(s.kod) : null} style={{ display: "grid", gridTemplateColumns: hasK ? "minmax(0,2.2fr) minmax(0,1fr) minmax(0,1fr) minmax(0,1fr) minmax(0,0.7fr)" : "minmax(0,2.5fr) minmax(0,1fr)", padding: "5px 12px", paddingLeft: 28, borderBottom: "0.5px solid var(--color-border-tertiary)", fontSize: 13, color: "var(--color-text-secondary)", cursor: s.children.length > 0 ? "pointer" : "default", background: expandedBil[s.kod] ? "rgba(133,183,235,0.06)" : "transparent" }}><span style={{ display: "flex", alignItems: "center", gap: 6 }}>{s.children.length > 0 && <span style={{ fontSize: 9, color: "var(--color-text-tertiary)", transition: "transform 0.2s", transform: expandedBil[s.kod] ? "rotate(90deg)" : "rotate(0deg)" }}>▶</span>}{s.kod} {s.ad}</span><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatN(s.val)}</span>{hasK && s.valK != null && <><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatN(s.valK)}</span><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums", color: s.val - s.valK >= 0 ? "var(--color-text-success)" : "var(--color-text-danger)" }}>{s.val - s.valK >= 0 ? "+" : ""}{formatN(s.val - s.valK)}</span><span style={{ textAlign: "right" }}><Badge val={degFn(s.val, s.valK)} /></span></>}</div>{expandedBil[s.kod] && s.children.map((c) => (<div key={c.kod} style={{ display: "grid", gridTemplateColumns: hasK ? "minmax(0,2.2fr) minmax(0,1fr) minmax(0,1fr) minmax(0,1fr) minmax(0,0.7fr)" : "minmax(0,2.5fr) minmax(0,1fr)", padding: "3px 12px", paddingLeft: 48, borderBottom: "0.5px solid var(--color-border-tertiary)", fontSize: 12, color: "var(--color-text-tertiary)" }}><span>{c.kod} {c.ad}</span><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatN(c.val)}</span>{hasK && c.valK != null && <><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatN(c.valK)}</span><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums", color: c.val - c.valK >= 0 ? "var(--color-text-success)" : "var(--color-text-danger)" }}>{c.val - c.valK >= 0 ? "+" : ""}{formatN(c.val - c.valK)}</span><span style={{ textAlign: "right" }}><Badge val={degFn(c.val, c.valK)} /></span></>}</div>))}</div>))}
             <BRow label={"  Donem Net Kari (Hesaplanan)"} v1={donemKariRow.val} v2={hasK ? donemKariRow.valK : null} sub />
             <BRow label="PASIF TOPLAM" v1={b.pasif} v2={bK ? bK.pasif : null} bold hl />
           </div>
@@ -1454,8 +1650,8 @@ export default function App() {
 
             if (!notlar.length) return null;
 
-            const skorBg = (s) => s === "iyi" ? "#E1F5EE" : s === "orta" ? "#FAEEDA" : "#FCEBEB";
-            const skorRenk = (s) => s === "iyi" ? "#0F6E56" : s === "orta" ? "#BA7517" : "#A32D2D";
+            const skorBg = (s) => s === "iyi" ? "var(--color-background-success)" : s === "orta" ? "var(--color-background-warning)" : "var(--color-background-danger)";
+            const skorRenk = (s) => s === "iyi" ? "var(--color-text-success)" : s === "orta" ? "var(--color-text-warning)" : "var(--color-text-danger)";
 
             return (
               <div style={{ marginTop: "1.5rem" }}>
@@ -1615,8 +1811,8 @@ export default function App() {
           {/* Yonetici Notlari */}
           {(() => {
             const notlar = [];
-            const skorBg = (s) => s === "iyi" ? "#E1F5EE" : s === "orta" ? "#FAEEDA" : "#FCEBEB";
-            const skorRenk = (s) => s === "iyi" ? "#0F6E56" : s === "orta" ? "#BA7517" : "#A32D2D";
+            const skorBg = (s) => s === "iyi" ? "var(--color-background-success)" : s === "orta" ? "var(--color-background-warning)" : "var(--color-background-danger)";
+            const skorRenk = (s) => s === "iyi" ? "var(--color-text-success)" : s === "orta" ? "var(--color-text-warning)" : "var(--color-text-danger)";
 
             // Net nakit degisimi
             if (na.netNakit > 0) notlar.push({ tip: "iyi", mesaj: "Net nakit degisimi pozitif (" + formatN(na.netNakit) + " TL). Isletme nakit uretiyor." });
@@ -1683,13 +1879,13 @@ export default function App() {
           ["Cari oran", a.co, aK?.co, ">1.5", renk(a.co, 1.5, 1)],
           ["Asit-test", a.at, aK?.at, ">1.0", renk(a.at, 1, 0.5)],
           ["Nakit orani", a.no, aK?.no, ">0.2", renk(a.no, 0.2, 0.1)],
-          ["Borc/Ozkaynak", a.bo, aK?.bo, "<1.0", a.bo <= 1 ? "#0F6E56" : "#A32D2D"],
+          ["Borc/Ozkaynak", a.bo, aK?.bo, "<1.0", a.bo <= 1 ? "var(--color-text-success)" : "var(--color-text-danger)"],
           ["Brut kar marji %", a.bkm, aK?.bkm, ">%20", renk(a.bkm, 20, 10)],
           ["Net kar marji %", a.nkm, aK?.nkm, ">%5", renk(a.nkm, 5, 0)],
           ["ROE %", a.roe, aK?.roe, ">%15", renk(a.roe, 15, 5)],
           ["ROA %", a.roa, aK?.roa, ">%5", renk(a.roa, 5, 2)],
-          ["Alacak tahsil (gun)", a.ag, aK?.ag, "<45", a.ag > 0 && a.ag <= 45 ? "#0F6E56" : "#A32D2D"],
-          ["Stok devir (gun)", a.sg, aK?.sg, "<60", a.sg > 0 && a.sg <= 60 ? "#0F6E56" : "#A32D2D"],
+          ["Alacak tahsil (gun)", a.ag, aK?.ag, "<45", a.ag > 0 && a.ag <= 45 ? "var(--color-text-success)" : "var(--color-text-danger)"],
+          ["Stok devir (gun)", a.sg, aK?.sg, "<60", a.sg > 0 && a.sg <= 60 ? "var(--color-text-success)" : "var(--color-text-danger)"],
         ];
         const fmtO = (v, l) => l.includes("%") ? "%" + v.toFixed(1) : l.includes("gun") ? Math.round(v) + " gun" : v.toFixed(2);
 
@@ -1711,7 +1907,7 @@ export default function App() {
           if (aK) t += '<th class="r">' + d2 + '</th><th class="r">Fark</th>';
           t += '<th>Standart</th></tr>';
           for (const [l, v1, v2, std, clr] of oranData) {
-            t += '<tr><td>' + l + '</td><td class="r" style="color:' + clr + '">' + fmtO(v1, l) + '</td>';
+            t += '<tr><td>' + l + '</td><td class="r" style="color:' + hexOf(clr) + '">' + fmtO(v1, l) + '</td>';
             if (aK && v2 != null) { const f = v1 - v2; t += '<td class="r">' + fmtO(v2, l) + '</td><td class="r ' + (f >= 0 ? 'g' : 'rd') + '">' + (f >= 0 ? '+' : '') + f.toFixed(2) + '</td>'; }
             t += '<td>' + std + '</td></tr>';
           }
@@ -1736,7 +1932,7 @@ export default function App() {
           </div>
           {aK && (<div style={{ border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-lg)", overflow: "hidden", marginBottom: "1.5rem" }}>
             <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr 1fr 1fr 0.7fr", padding: "8px 12px", background: "var(--color-background-secondary)", fontWeight: 500, fontSize: 12, color: "var(--color-text-secondary)" }}><span>Oran</span><span style={{ textAlign: "right" }}>{d1}</span><span style={{ textAlign: "right" }}>{d2}</span><span style={{ textAlign: "right" }}>Fark</span><span style={{ textAlign: "right" }}>Std</span></div>
-            {oranData.map(([l, v1, v2, std, clr]) => { const f = v1 - v2; return (<div key={l} style={{ display: "grid", gridTemplateColumns: "2fr 1fr 1fr 1fr 0.7fr", padding: "7px 12px", borderBottom: "0.5px solid var(--color-border-tertiary)", fontSize: 13 }}><span>{l}</span><span style={{ textAlign: "right", fontWeight: 500, color: clr }}>{fmtO(v1, l)}</span><span style={{ textAlign: "right" }}>{fmtO(v2, l)}</span><span style={{ textAlign: "right", color: f >= 0 ? "#0F6E56" : "#A32D2D" }}>{f >= 0 ? "+" : ""}{f.toFixed(2)}</span><span style={{ textAlign: "right", fontSize: 11, color: "var(--color-text-tertiary)" }}>{std}</span></div>); })}
+            {oranData.map(([l, v1, v2, std, clr]) => { const f = v1 - v2; return (<div key={l} style={{ display: "grid", gridTemplateColumns: "2fr 1fr 1fr 1fr 0.7fr", padding: "7px 12px", borderBottom: "0.5px solid var(--color-border-tertiary)", fontSize: 13 }}><span>{l}</span><span style={{ textAlign: "right", fontWeight: 500, color: clr }}>{fmtO(v1, l)}</span><span style={{ textAlign: "right" }}>{fmtO(v2, l)}</span><span style={{ textAlign: "right", color: f >= 0 ? "var(--color-text-success)" : "var(--color-text-danger)" }}>{f >= 0 ? "+" : ""}{f.toFixed(2)}</span><span style={{ textAlign: "right", fontSize: 11, color: "var(--color-text-tertiary)" }}>{std}</span></div>); })}
           </div>)}
           {!aK && (<div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 12 }}>
             {oranData.map(([l, v1, v2, std, clr]) => (<OranCard key={l} ad={l} deger={fmtO(v1, l)} ac={std} renk={clr} />))}
@@ -1748,8 +1944,8 @@ export default function App() {
 
           {/* Yonetici Notlari - Oran Aciklamalari */}
           {(() => {
-            const skorBg2 = (s) => s === "iyi" ? "#E1F5EE" : s === "orta" ? "#FAEEDA" : "#FCEBEB";
-            const skorRenk2 = (s) => s === "iyi" ? "#0F6E56" : s === "orta" ? "#BA7517" : "#A32D2D";
+            const skorBg2 = (s) => s === "iyi" ? "var(--color-background-success)" : s === "orta" ? "var(--color-background-warning)" : "var(--color-background-danger)";
+            const skorRenk2 = (s) => s === "iyi" ? "var(--color-text-success)" : s === "orta" ? "var(--color-text-warning)" : "var(--color-text-danger)";
             const skorIcon2 = (s) => s === "iyi" ? "+" : s === "orta" ? "~" : "!";
 
             const oranNotlari = [
@@ -1858,8 +2054,8 @@ export default function App() {
         const aK = karsi >= 0 ? analizler[karsi] : null;
         const gK2 = gK, bK2 = bK;
         const skor = (val, iyi, orta) => val >= iyi ? "iyi" : val >= orta ? "orta" : "kotu";
-        const skorRenk = (s) => s === "iyi" ? "#0F6E56" : s === "orta" ? "#BA7517" : "#A32D2D";
-        const skorBg = (s) => s === "iyi" ? "#E1F5EE" : s === "orta" ? "#FAEEDA" : "#FCEBEB";
+        const skorRenk = (s) => s === "iyi" ? "var(--color-text-success)" : s === "orta" ? "var(--color-text-warning)" : "var(--color-text-danger)";
+        const skorBg = (s) => s === "iyi" ? "var(--color-background-success)" : s === "orta" ? "var(--color-background-warning)" : "var(--color-background-danger)";
         const skorLabel = (s) => s === "iyi" ? "SAGLAM" : s === "orta" ? "TAKIP ET" : "RISK";
         const notlar = [];
         if (a.co < 1) notlar.push({ tip: "kotu", mesaj: "Cari oran 1'in altinda. Kisa vadeli yukumlulukleri karsilamakta zorluk yasanabilir." }); else if (a.co < 1.5) notlar.push({ tip: "orta", mesaj: "Cari oran kabul edilebilir ama guvenlik marji dusuk." }); else notlar.push({ tip: "iyi", mesaj: "Cari oran guclu. Kisa vadeli borclari rahat karsilayabilirsiniz." });
@@ -1887,7 +2083,7 @@ export default function App() {
         };
         const doExportHTML = () => {
           let t = '<div style="display:flex;gap:12px;margin-bottom:20px;">';
-          for (const [l, sk, val, sub, desc] of durum) t += '<div style="flex:1;padding:14px;border-radius:12px;background:' + skorBg(sk) + ';"><div style="font-size:11px;color:' + skorRenk(sk) + ';margin-bottom:4px;">' + l + '</div><div style="font-size:22px;font-weight:700;color:' + skorRenk(sk) + ';">' + val + '</div><div style="font-size:10px;color:' + skorRenk(sk) + ';opacity:0.7;">' + desc + '</div></div>';
+          for (const [l, sk, val, sub, desc] of durum) t += '<div style="flex:1;padding:14px;border-radius:12px;background:' + hexOf(skorBg(sk)) + ';"><div style="font-size:11px;color:' + hexOf(skorRenk(sk)) + ';margin-bottom:4px;">' + l + '</div><div style="font-size:22px;font-weight:700;color:' + hexOf(skorRenk(sk)) + ';">' + val + '</div><div style="font-size:10px;color:' + hexOf(skorRenk(sk)) + ';opacity:0.7;">' + desc + '</div></div>';
           t += '</div>';
           t += '<h2>Temel Gostergeler</h2><table><tr><th>Gosterge</th><th class="r">' + d1 + '</th>' + (hasK ? '<th class="r">' + d2 + '</th><th class="r">Degisim</th>' : '') + '</tr>';
           for (const [l, v1, v2] of metrikler) { t += '<tr><td class="b">' + l + '</td><td class="r">' + formatN(v1) + '</td>'; if (hasK && v2 != null) { const p = (v1 - v2) / Math.abs(v2) * 100; t += '<td class="r">' + formatN(v2) + '</td><td class="r ' + (p >= 0 ? 'g' : 'rd') + '">' + (p >= 0 ? '+' : '') + p.toFixed(1) + '%</td>'; } t += '</tr>'; }
@@ -1941,6 +2137,7 @@ export default function App() {
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "1.25rem" }}>
             <div><div style={{ fontSize: 20, fontWeight: 600 }}>Yonetici Dashboard</div><div style={{ fontSize: 13, color: "var(--color-text-secondary)" }}>{d1}{hasK ? " / " + d2 : ""}</div></div>
             <div style={{ display: "flex", gap: 8 }}>
+              <button onClick={() => setTab(12)} style={{ ...DL_STYLE, background: "var(--color-text-info)", color: "var(--color-background-primary)", border: "none" }}>AI yorum</button>
               <button onClick={doExportCSV} style={DL_STYLE}>CSV</button>
               <button onClick={doExportHTML} style={{ ...DL_STYLE, background: "var(--color-background-success)", color: "var(--color-text-success)", border: "0.5px solid var(--color-border-success)" }}>PDF</button>
             </div>
@@ -1982,7 +2179,7 @@ export default function App() {
                 <div key={l} style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 6 }}>
                   <span style={{ fontSize: 11, color: "var(--color-text-secondary)", minWidth: 100 }}>{l}</span>
                   <div style={{ flex: 1, height: 10, borderRadius: 99, background: "var(--color-background-secondary)", overflow: "hidden" }}><div style={{ width: Math.max(0, Math.min(100, v)) + "%", height: "100%", background: c, borderRadius: 99 }} /></div>
-                  <span style={{ fontSize: 12, fontWeight: 600, minWidth: 45, textAlign: "right", color: v >= 0 ? c : "#A32D2D" }}>%{v.toFixed(1)}</span>
+                  <span style={{ fontSize: 12, fontWeight: 600, minWidth: 45, textAlign: "right", color: v >= 0 ? c : "var(--color-text-danger)" }}>%{v.toFixed(1)}</span>
                 </div>))}
             </div>
             <div style={{ padding: 18, borderRadius: 14, background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-tertiary)" }}>
@@ -2009,10 +2206,12 @@ export default function App() {
               </div>))}
           </div>
 
+          <KontrolKutusu items={kontroller[sel]} />
+
           {/* Notlar */}
           <div style={{ fontSize: 15, fontWeight: 500, marginBottom: 10 }}>Yonetici notlari</div>
           <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: "1.5rem" }}>
-            {notlar.map((n, i) => (<div key={i} style={{ display: "flex", gap: 10, alignItems: "flex-start", padding: "12px 16px", background: skorBg(n.tip), borderRadius: 10, borderLeft: "3px solid " + skorRenk(n.tip) }}><span style={{ fontWeight: 600, flexShrink: 0, color: skorRenk(n.tip) }}>{n.tip === "iyi" ? "+" : n.tip === "orta" ? "~" : "!"}</span><span style={{ fontSize: 13, lineHeight: 1.6 }}>{n.mesaj}</span></div>))}
+            {notlar.map((n, i) => (<div key={i} style={{ display: "flex", gap: 10, alignItems: "flex-start", padding: "12px 16px", background: skorBg(n.tip), borderRadius: 10, borderLeft: "3px solid " + skorRenk(n.tip) }}><span style={{ fontWeight: 600, flexShrink: 0, color: skorRenk(n.tip) }}>{n.tip === "iyi" ? "+" : n.tip === "orta" ? "~" : "!"}</span><span style={{ fontSize: 13, lineHeight: 1.6, color: "var(--color-text-primary)" }}>{n.mesaj}</span></div>))}
           </div>
 
           {/* Donemler Arasi — Coklu donem destekli */}
@@ -2054,14 +2253,17 @@ export default function App() {
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", ...SEC }}>
           <span>Degerlendirme ve oneriler{hasK ? " — Karsilastirma" : ""}</span>
           <div style={{ display: "flex", gap: 8 }}>
-            <button onClick={() => exportFullHTML(g, gK, b, bK, a, rapor, d1, d2)} style={DL_STYLE}>Tam Rapor HTML</button>
+            <button onClick={() => setTab(12)} style={{ ...DL_STYLE, background: "var(--color-text-info)", color: "var(--color-background-primary)", border: "none" }}>AI yorum</button>
+            <button onClick={() => exportFullHTML(g, gK, b, bK, a, rapor, d1, d2, kontroller[sel], aiSon ? aiSon.content : null)} style={DL_STYLE}>Tam Rapor HTML</button>
             <button onClick={() => { exportGelirCSV(g, gK, d1, d2); setTimeout(() => exportBilancoCSV(b, bK, g, d1, d2), 300); }} style={{ ...DL_STYLE, background: "var(--color-background-success)", color: "var(--color-text-success)", border: "0.5px solid var(--color-border-success)" }}>Tum CSV</button>
           </div></div>
         {hasK && (<div style={{ border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-lg)", overflow: "hidden", marginBottom: "1.5rem" }}>
           <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr 1fr 1fr", padding: "8px 12px", background: "var(--color-background-secondary)", fontSize: 12, fontWeight: 500, color: "var(--color-text-secondary)" }}><span>Gosterge</span><span style={{ textAlign: "right" }}>{d1}</span><span style={{ textAlign: "right" }}>{d2}</span><span style={{ textAlign: "right" }}>Degisim</span></div>
           {[["Net satis", g.netSatis, gK.netSatis], ["Brut kar", g.brutKar, gK.brutKar], ["Faaliyet kari", g.faalKar, gK.faalKar], ["Net kar", g.donemKari, gK.donemKari]].map(([l, v1, v2]) => (<div key={l} style={{ display: "grid", gridTemplateColumns: "2fr 1fr 1fr 1fr", padding: "8px 12px", borderBottom: "0.5px solid var(--color-border-tertiary)", fontSize: 13 }}><span>{l}</span><span style={{ textAlign: "right" }}>{formatN(v1)}</span><span style={{ textAlign: "right" }}>{formatN(v2)}</span><span style={{ textAlign: "right" }}><Badge val={degFn(v1, v2)} /></span></div>))}
         </div>)}
-        {[["Guclu yonler", rapor.ar, "#0F6E56", "+"], ["Zayif yonler", rapor.ek, "#A32D2D", "!"], ["Oneriler", rapor.on, "#185FA5", ">"]].map(([title, items, color, icon]) => (
+        <div style={{ height: 12 }} />
+        <KontrolKutusu items={kontroller[sel]} />
+        {[["Guclu yonler", rapor.ar, "var(--color-text-success)", "+"], ["Zayif yonler", rapor.ek, "var(--color-text-danger)", "!"], ["Oneriler", rapor.on, "var(--color-text-info)", ">"]].map(([title, items, color, icon]) => (
           <div key={title}><div style={SEC}>{title}</div><div style={{ display: "flex", flexDirection: "column", gap: 8 }}>{items.map((it, i) => (<div key={i} style={{ display: "flex", gap: 10, alignItems: "flex-start", padding: "10px 14px", background: "var(--color-background-secondary)", borderRadius: "var(--border-radius-md)", borderLeft: "3px solid " + color }}><span style={{ fontWeight: 500, flexShrink: 0 }}>{icon}</span><span style={{ fontSize: 14, lineHeight: 1.6 }}>{it}</span></div>))}</div></div>))}
       </div>)}
 
@@ -2106,26 +2308,26 @@ export default function App() {
         };
         const doExportHTML = () => {
           const fn = (n) => formatN(n);
-          const clr = (v) => v >= 0 ? "#0F6E56" : "#A32D2D";
+          const clr = (v) => v >= 0 ? "var(--color-text-success)" : "var(--color-text-danger)";
           let t = '<h2>Vergi Hesaplama</h2>';
           t += '<table><tr><th style="width:60%">Kalem</th><th class="r">Tutar</th></tr>';
           t += '<tr class="b"><td>1. Donem Kari / Zarari</td><td class="r">' + fn(donemKari) + '</td></tr>';
           t += '<tr><td>2. Satilan Mal Maliyeti</td><td class="r">' + fn(smmVal) + '</td></tr>';
           t += '<tr><td>3. KKEG (689 Hesap)</td><td class="r">' + fn(kkeg689) + '</td></tr>';
           t += '<tr class="b hl"><td>4. Matrah (1 - 2 + 3)</td><td class="r">' + fn(matrah) + '</td></tr>';
-          t += '<tr class="b"><td>5. Hesaplanan Vergi (Matrah x %' + oranVal + ')</td><td class="r" style="color:' + clr(-hesaplananVergi) + '">' + fn(hesaplananVergi) + '</td></tr>';
+          t += '<tr class="b"><td>5. Hesaplanan Vergi (Matrah x %' + oranVal + ')</td><td class="r" style="color:' + hexOf(clr(-hesaplananVergi)) + '">' + fn(hesaplananVergi) + '</td></tr>';
           t += '<tr><td>6. Odenen Vergi</td><td class="r">' + fn(odenenVal) + '</td></tr>';
-          t += '<tr class="b hl"><td>7. Odenmesi Gereken Vergi (5 - 6)</td><td class="r" style="color:' + clr(-odenmesiGereken) + '">' + fn(odenmesiGereken) + '</td></tr>';
+          t += '<tr class="b hl"><td>7. Odenmesi Gereken Vergi (5 - 6)</td><td class="r" style="color:' + hexOf(clr(-odenmesiGereken)) + '">' + fn(odenmesiGereken) + '</td></tr>';
           t += '</table>';
           downloadHTML(buildHTMLReport('Vergi Hesaplama - ' + d1, t, ''), 'Vergi_' + d1.replace(/\s/g, '_') + '.html');
         };
 
-        const manuelInputStyle = { padding: "10px 14px", fontSize: 15, fontWeight: 500, border: "2px solid #185FA5", borderRadius: "var(--border-radius-md)", background: "#E6F1FB", color: "#185FA5", textAlign: "right", width: 200, fontVariantNumeric: "tabular-nums", outline: "none" };
-        const oranInputStyle = { width: 48, padding: "6px 4px", fontSize: 15, fontWeight: 600, border: "2px solid #185FA5", borderRadius: "var(--border-radius-md)", background: "#E6F1FB", color: "#185FA5", textAlign: "center", outline: "none" };
+        const manuelInputStyle = { padding: "10px 14px", fontSize: 15, fontWeight: 500, border: "2px solid var(--color-text-info)", borderRadius: "var(--border-radius-md)", background: "var(--color-background-info)", color: "var(--color-text-info)", textAlign: "right", width: 200, fontVariantNumeric: "tabular-nums", outline: "none" };
+        const oranInputStyle = { width: 48, padding: "6px 4px", fontSize: 15, fontWeight: 600, border: "2px solid var(--color-text-info)", borderRadius: "var(--border-radius-md)", background: "var(--color-background-info)", color: "var(--color-text-info)", textAlign: "center", outline: "none" };
         const labelStyle = { fontSize: 14, color: "var(--color-text-primary)" };
         const autoStyle = { fontSize: 14, fontWeight: 500, fontVariantNumeric: "tabular-nums", textAlign: "right", minWidth: 180 };
         const rowStyle = (hl, isManuel) => ({ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "12px 16px", borderBottom: "0.5px solid var(--color-border-tertiary)", background: isManuel ? "rgba(24,95,165,0.04)" : hl ? "var(--color-background-secondary)" : "transparent" });
-        const manuelBadge = <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 99, background: "#E6F1FB", color: "#185FA5", fontWeight: 500, marginLeft: 6 }}>GIRIS</span>;
+        const manuelBadge = <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 99, background: "var(--color-background-info)", color: "var(--color-text-info)", fontWeight: 500, marginLeft: 6 }}>GIRIS</span>;
 
         return (<div>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", ...SEC }}>
@@ -2167,7 +2369,7 @@ export default function App() {
                 <span style={{ fontSize: 12, color: "var(--color-text-tertiary)" }}>5</span>
                 <span style={labelStyle}>Hesaplanan vergi</span>
                 <div style={{ display: "flex", alignItems: "center", gap: 2 }}>
-                  <span style={{ fontSize: 13, color: "#185FA5", fontWeight: 600 }}>%</span>
+                  <span style={{ fontSize: 13, color: "var(--color-text-info)", fontWeight: 600 }}>%</span>
                   <input type="text" value={vergiOran} onChange={(e) => setVergiOran(e.target.value.replace(/[^0-9.,]/g, ""))} style={oranInputStyle} />
                 </div>
                 {manuelBadge}
@@ -2189,7 +2391,7 @@ export default function App() {
           </div>
 
           <div style={{ marginTop: 16, padding: "12px 16px", background: "var(--color-background-secondary)", borderRadius: "var(--border-radius-md)", fontSize: 12, color: "var(--color-text-secondary)", lineHeight: 1.7 }}>
-            <span style={{ display: "inline-block", fontSize: 10, padding: "2px 8px", borderRadius: 99, background: "#E6F1FB", color: "#185FA5", fontWeight: 500, marginRight: 6 }}>GIRIS</span> isaretli alanlar manuel duzenlenir. Diger degerler mizandan otomatik gelir.
+            <span style={{ display: "inline-block", fontSize: 10, padding: "2px 8px", borderRadius: 99, background: "var(--color-background-info)", color: "var(--color-text-info)", fontWeight: 500, marginRight: 6 }}>GIRIS</span> isaretli alanlar manuel duzenlenir. Diger degerler mizandan otomatik gelir.
           </div>
 
           {/* Stok Takip - Bilgi Amacli */}
@@ -2227,19 +2429,19 @@ export default function App() {
                   {/* SMM ve Kalan */}
                   <div style={{ display: "flex", justifyContent: "space-between", padding: "10px 14px", borderBottom: "0.5px solid var(--color-border-tertiary)", fontSize: 14 }}>
                     <span>(-) Satilan mal maliyeti (yukarida girilen)</span>
-                    <span style={{ fontVariantNumeric: "tabular-nums", fontWeight: 500, color: "#A32D2D" }}>{smmVal > 0 ? "-" : ""}{formatN(smmVal)}</span>
+                    <span style={{ fontVariantNumeric: "tabular-nums", fontWeight: 500, color: "var(--color-text-danger)" }}>{smmVal > 0 ? "-" : ""}{formatN(smmVal)}</span>
                   </div>
 
-                  <div style={{ display: "flex", justifyContent: "space-between", padding: "12px 14px", background: kalanStok >= 0 ? "#E1F5EE" : "#FCEBEB", fontSize: 15, fontWeight: 700 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", padding: "12px 14px", background: kalanStok >= 0 ? "var(--color-background-success)" : "var(--color-background-danger)", fontSize: 15, fontWeight: 700 }}>
                     <span>Kalan stok</span>
-                    <span style={{ fontVariantNumeric: "tabular-nums", color: kalanStok >= 0 ? "#0F6E56" : "#A32D2D" }}>{formatN(kalanStok)}</span>
+                    <span style={{ fontVariantNumeric: "tabular-nums", color: kalanStok >= 0 ? "var(--color-text-success)" : "var(--color-text-danger)" }}>{formatN(kalanStok)}</span>
                   </div>
                 </div>
 
                 {kalanStok < 0 && (
-                  <div style={{ marginTop: 8, display: "flex", gap: 8, alignItems: "flex-start", padding: "10px 14px", background: "#FCEBEB", borderRadius: "var(--border-radius-md)", borderLeft: "3px solid #A32D2D" }}>
-                    <span style={{ fontWeight: 600, color: "#A32D2D" }}>!</span>
-                    <span style={{ fontSize: 12, color: "#A32D2D" }}>Girdiginiz satilan mal maliyeti ({formatN(smmVal)}) mizandaki toplam stoktan ({formatN(toplamStok)}) fazla. Donem ici alis yapilmis olabilir veya SMM tutarini kontrol edin.</span>
+                  <div style={{ marginTop: 8, display: "flex", gap: 8, alignItems: "flex-start", padding: "10px 14px", background: "var(--color-background-danger)", borderRadius: "var(--border-radius-md)", borderLeft: "3px solid var(--color-text-danger)" }}>
+                    <span style={{ fontWeight: 600, color: "var(--color-text-danger)" }}>!</span>
+                    <span style={{ fontSize: 12, color: "var(--color-text-danger)" }}>Girdiginiz satilan mal maliyeti ({formatN(smmVal)}) mizandaki toplam stoktan ({formatN(toplamStok)}) fazla. Donem ici alis yapilmis olabilir veya SMM tutarini kontrol edin.</span>
                   </div>
                 )}
               </div>
@@ -2258,13 +2460,13 @@ export default function App() {
           const mid = (low + high) / 2;
           let durum, durumLabel, durumBg, durumClr;
           if (reverse) {
-            if (val <= low) { durum = "iyi"; durumLabel = "SEKTOR USTUNDE"; durumBg = "#E1F5EE"; durumClr = "#0F6E56"; }
-            else if (val <= high) { durum = "orta"; durumLabel = "SEKTOR ORTALAMASI"; durumBg = "#FAEEDA"; durumClr = "#BA7517"; }
-            else { durum = "kotu"; durumLabel = "SEKTOR ALTINDA"; durumBg = "#FCEBEB"; durumClr = "#A32D2D"; }
+            if (val <= low) { durum = "iyi"; durumLabel = "SEKTOR USTUNDE"; durumBg = "var(--color-background-success)"; durumClr = "var(--color-text-success)"; }
+            else if (val <= high) { durum = "orta"; durumLabel = "SEKTOR ORTALAMASI"; durumBg = "var(--color-background-warning)"; durumClr = "var(--color-text-warning)"; }
+            else { durum = "kotu"; durumLabel = "SEKTOR ALTINDA"; durumBg = "var(--color-background-danger)"; durumClr = "var(--color-text-danger)"; }
           } else {
-            if (val >= high) { durum = "iyi"; durumLabel = "SEKTOR USTUNDE"; durumBg = "#E1F5EE"; durumClr = "#0F6E56"; }
-            else if (val >= low) { durum = "orta"; durumLabel = "SEKTOR ORTALAMASI"; durumBg = "#FAEEDA"; durumClr = "#BA7517"; }
-            else { durum = "kotu"; durumLabel = "SEKTOR ALTINDA"; durumBg = "#FCEBEB"; durumClr = "#A32D2D"; }
+            if (val >= high) { durum = "iyi"; durumLabel = "SEKTOR USTUNDE"; durumBg = "var(--color-background-success)"; durumClr = "var(--color-text-success)"; }
+            else if (val >= low) { durum = "orta"; durumLabel = "SEKTOR ORTALAMASI"; durumBg = "var(--color-background-warning)"; durumClr = "var(--color-text-warning)"; }
+            else { durum = "kotu"; durumLabel = "SEKTOR ALTINDA"; durumBg = "var(--color-background-danger)"; durumClr = "var(--color-text-danger)"; }
           }
           const fmtV = unit === "%" ? "%" + val.toFixed(1) : unit === "gun" ? Math.round(val) + " gun" : val.toFixed(2);
           const fmtR = unit === "%" ? "%" + low + " - %" + high : unit === "gun" ? low + " - " + high + " gun" : low.toFixed(1) + " - " + high.toFixed(1);
@@ -2313,7 +2515,7 @@ export default function App() {
           t += '</div>';
           t += '<table><tr><th>Oran</th><th class="r">Firma</th><th class="r">Sektor Araligi</th><th>Durum</th></tr>';
           for (const i of items) {
-            t += '<tr><td>' + i.label + '</td><td class="r b">' + i.fmtV + '</td><td class="r">' + i.fmtR + '</td><td style="color:' + i.durumClr + ';font-weight:600;">' + i.durumLabel + '</td></tr>';
+            t += '<tr><td>' + i.label + '</td><td class="r b">' + i.fmtV + '</td><td class="r">' + i.fmtR + '</td><td style="color:' + hexOf(i.durumClr) + ';font-weight:600;">' + i.durumLabel + '</td></tr>';
           }
           t += '</table>';
           // Add recommendations to HTML
@@ -2349,17 +2551,17 @@ export default function App() {
 
           {/* Ozet Kartlari */}
           <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 12, marginBottom: "1.5rem" }}>
-            <div style={{ padding: "16px", background: "#E1F5EE", borderRadius: "var(--border-radius-lg)", textAlign: "center" }}>
-              <div style={{ fontSize: 28, fontWeight: 600, color: "#0F6E56" }}>{ustunde}</div>
-              <div style={{ fontSize: 12, color: "#0F6E56" }}>Sektor ustunde</div>
+            <div style={{ padding: "16px", background: "var(--color-background-success)", borderRadius: "var(--border-radius-lg)", textAlign: "center" }}>
+              <div style={{ fontSize: 28, fontWeight: 600, color: "var(--color-text-success)" }}>{ustunde}</div>
+              <div style={{ fontSize: 12, color: "var(--color-text-success)" }}>Sektor ustunde</div>
             </div>
-            <div style={{ padding: "16px", background: "#FAEEDA", borderRadius: "var(--border-radius-lg)", textAlign: "center" }}>
-              <div style={{ fontSize: 28, fontWeight: 600, color: "#BA7517" }}>{ortalama}</div>
-              <div style={{ fontSize: 12, color: "#BA7517" }}>Sektor ortalamasi</div>
+            <div style={{ padding: "16px", background: "var(--color-background-warning)", borderRadius: "var(--border-radius-lg)", textAlign: "center" }}>
+              <div style={{ fontSize: 28, fontWeight: 600, color: "var(--color-text-warning)" }}>{ortalama}</div>
+              <div style={{ fontSize: 12, color: "var(--color-text-warning)" }}>Sektor ortalamasi</div>
             </div>
-            <div style={{ padding: "16px", background: "#FCEBEB", borderRadius: "var(--border-radius-lg)", textAlign: "center" }}>
-              <div style={{ fontSize: 28, fontWeight: 600, color: "#A32D2D" }}>{altinda}</div>
-              <div style={{ fontSize: 12, color: "#A32D2D" }}>Sektor altinda</div>
+            <div style={{ padding: "16px", background: "var(--color-background-danger)", borderRadius: "var(--border-radius-lg)", textAlign: "center" }}>
+              <div style={{ fontSize: 28, fontWeight: 600, color: "var(--color-text-danger)" }}>{altinda}</div>
+              <div style={{ fontSize: 12, color: "var(--color-text-danger)" }}>Sektor altinda</div>
             </div>
           </div>
 
@@ -2382,7 +2584,7 @@ export default function App() {
                 {/* Visual bar */}
                 <div style={{ position: "relative", height: 8, background: "var(--color-background-secondary)", borderRadius: 99, overflow: "visible" }}>
                   {/* Sektor range band */}
-                  <div style={{ position: "absolute", left: item.barLowPct + "%", width: Math.max(1, item.barHighPct - item.barLowPct) + "%", height: "100%", background: "#FAEEDA", borderRadius: 99 }} />
+                  <div style={{ position: "absolute", left: item.barLowPct + "%", width: Math.max(1, item.barHighPct - item.barLowPct) + "%", height: "100%", background: "var(--color-background-warning)", borderRadius: 99 }} />
                   {/* Firma position dot */}
                   <div style={{ position: "absolute", left: "calc(" + item.barValPct + "% - 5px)", top: -1, width: 10, height: 10, borderRadius: "50%", background: item.durumClr, border: "2px solid var(--color-background-primary)" }} />
                 </div>
@@ -2504,9 +2706,9 @@ export default function App() {
                     <div style={SEC}>Guclu yonleriniz</div>
                     <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: "1.5rem" }}>
                       {iyiNotlar.map((n, i) => (
-                        <div key={i} style={{ display: "flex", gap: 8, alignItems: "center", padding: "10px 14px", background: "#E1F5EE", borderRadius: "var(--border-radius-md)", borderLeft: "3px solid #0F6E56" }}>
-                          <span style={{ fontWeight: 500, color: "#0F6E56", flexShrink: 0 }}>+</span>
-                          <span style={{ fontSize: 13, color: "#0F6E56" }}>{n}</span>
+                        <div key={i} style={{ display: "flex", gap: 8, alignItems: "center", padding: "10px 14px", background: "var(--color-background-success)", borderRadius: "var(--border-radius-md)", borderLeft: "3px solid var(--color-text-success)" }}>
+                          <span style={{ fontWeight: 500, color: "var(--color-text-success)", flexShrink: 0 }}>+</span>
+                          <span style={{ fontSize: 13, color: "var(--color-text-success)" }}>{n}</span>
                         </div>
                       ))}
                     </div>
@@ -2519,9 +2721,9 @@ export default function App() {
                     <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
                       {oneriler.map((o, oi) => (
                         <div key={oi} style={{ border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-lg)", overflow: "hidden" }}>
-                          <div style={{ padding: "10px 14px", background: "#FCEBEB", borderBottom: "0.5px solid var(--color-border-tertiary)", display: "flex", alignItems: "center", gap: 8 }}>
-                            <span style={{ fontSize: 12, fontWeight: 600, color: "#A32D2D" }}>!</span>
-                            <span style={{ fontSize: 13, fontWeight: 500, color: "#A32D2D" }}>{o.baslik}</span>
+                          <div style={{ padding: "10px 14px", background: "var(--color-background-danger)", borderBottom: "0.5px solid var(--color-border-tertiary)", display: "flex", alignItems: "center", gap: 8 }}>
+                            <span style={{ fontSize: 12, fontWeight: 600, color: "var(--color-text-danger)" }}>!</span>
+                            <span style={{ fontSize: 13, fontWeight: 500, color: "var(--color-text-danger)" }}>{o.baslik}</span>
                           </div>
                           <div style={{ padding: "12px 14px" }}>
                             {o.maddeler.map((m, mi) => (
@@ -2682,29 +2884,29 @@ export default function App() {
               <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginBottom: 4 }}>Toplam Gider ({d2.substring(0, 10)})</div>
               <div style={{ fontSize: 20, fontWeight: 600 }}>{formatN(toplamK)}</div>
             </div>
-            <div style={{ padding: "16px", borderRadius: 14, background: toplamS - toplamK > 0 ? "#FCEBEB" : "#E1F5EE", border: "0.5px solid var(--color-border-tertiary)" }}>
+            <div style={{ padding: "16px", borderRadius: 14, background: toplamS - toplamK > 0 ? "var(--color-background-danger)" : "var(--color-background-success)", border: "0.5px solid var(--color-border-tertiary)" }}>
               <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginBottom: 4 }}>Fark</div>
-              <div style={{ fontSize: 20, fontWeight: 600, color: toplamS - toplamK > 0 ? "#A32D2D" : "#0F6E56" }}>{toplamS - toplamK > 0 ? "+" : ""}{formatN(toplamS - toplamK)}</div>
+              <div style={{ fontSize: 20, fontWeight: 600, color: toplamS - toplamK > 0 ? "var(--color-text-danger)" : "var(--color-text-success)" }}>{toplamS - toplamK > 0 ? "+" : ""}{formatN(toplamS - toplamK)}</div>
             </div>
             <div style={{ padding: "16px", borderRadius: 14, background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-tertiary)" }}>
               <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginBottom: 4 }}>Degisim</div>
-              <div style={{ fontSize: 20, fontWeight: 600, color: toplamS > toplamK ? "#A32D2D" : "#0F6E56" }}>{toplamK !== 0 ? (((toplamS - toplamK) / Math.abs(toplamK)) * 100).toFixed(1) : "-"}%</div>
+              <div style={{ fontSize: 20, fontWeight: 600, color: toplamS > toplamK ? "var(--color-text-danger)" : "var(--color-text-success)" }}>{toplamK !== 0 ? (((toplamS - toplamK) / Math.abs(toplamK)) * 100).toFixed(1) : "-"}%</div>
             </div>
           </div>
 
           {/* Top 10 Artis */}
           {topArtis.length > 0 && (<div style={{ marginBottom: "1.5rem" }}>
-            <div style={{ fontSize: 15, fontWeight: 500, marginBottom: 10, color: "#A32D2D" }}>En cok artan 10 gider kalemi</div>
+            <div style={{ fontSize: 15, fontWeight: 500, marginBottom: 10, color: "var(--color-text-danger)" }}>En cok artan 10 gider kalemi</div>
             <div style={{ border: "0.5px solid var(--color-border-tertiary)", borderRadius: 14, overflow: "hidden" }}>
-              <div style={{ display: "grid", gridTemplateColumns: "0.8fr 2fr 1fr 1fr 1fr 0.7fr", padding: "8px 12px", background: "#FCEBEB", fontSize: 11, fontWeight: 500, color: "#A32D2D" }}><span>Kod</span><span>Hesap</span><span style={{ textAlign: "right" }}>{d1}</span><span style={{ textAlign: "right" }}>{d2}</span><span style={{ textAlign: "right" }}>Artis</span><span style={{ textAlign: "right" }}>%</span></div>
+              <div style={{ display: "grid", gridTemplateColumns: "0.8fr 2fr 1fr 1fr 1fr 0.7fr", padding: "8px 12px", background: "var(--color-background-danger)", fontSize: 11, fontWeight: 500, color: "var(--color-text-danger)" }}><span>Kod</span><span>Hesap</span><span style={{ textAlign: "right" }}>{d1}</span><span style={{ textAlign: "right" }}>{d2}</span><span style={{ textAlign: "right" }}>Artis</span><span style={{ textAlign: "right" }}>%</span></div>
               {topArtis.map((item, idx) => (
                 <div key={item.kod + "-" + idx} style={{ display: "grid", gridTemplateColumns: "0.8fr 2fr 1fr 1fr 1fr 0.7fr", padding: "8px 12px", borderBottom: "0.5px solid var(--color-border-tertiary)", fontSize: 13 }}>
                   <span style={{ fontSize: 11, color: "var(--color-text-tertiary)" }}>{item.kod}</span>
                   <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{item.ad}</span>
                   <span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatN(item.vS)}</span>
                   <span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums", color: "var(--color-text-secondary)" }}>{formatN(item.vK)}</span>
-                  <span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums", color: "#A32D2D", fontWeight: 500 }}>+{formatN(item.fark)}</span>
-                  <span style={{ textAlign: "right" }}><span style={{ fontSize: 11, padding: "2px 6px", borderRadius: 99, background: "#FCEBEB", color: "#A32D2D", fontWeight: 500 }}>+{item.pct.toFixed(0)}%</span></span>
+                  <span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums", color: "var(--color-text-danger)", fontWeight: 500 }}>+{formatN(item.fark)}</span>
+                  <span style={{ textAlign: "right" }}><span style={{ fontSize: 11, padding: "2px 6px", borderRadius: 99, background: "var(--color-background-danger)", color: "var(--color-text-danger)", fontWeight: 500 }}>+{item.pct.toFixed(0)}%</span></span>
                 </div>
               ))}
             </div>
@@ -2712,17 +2914,17 @@ export default function App() {
 
           {/* Top 10 Azalis */}
           {topAzalis.length > 0 && (<div style={{ marginBottom: "1.5rem" }}>
-            <div style={{ fontSize: 15, fontWeight: 500, marginBottom: 10, color: "#0F6E56" }}>En cok azalan 10 gider kalemi</div>
+            <div style={{ fontSize: 15, fontWeight: 500, marginBottom: 10, color: "var(--color-text-success)" }}>En cok azalan 10 gider kalemi</div>
             <div style={{ border: "0.5px solid var(--color-border-tertiary)", borderRadius: 14, overflow: "hidden" }}>
-              <div style={{ display: "grid", gridTemplateColumns: "0.8fr 2fr 1fr 1fr 1fr 0.7fr", padding: "8px 12px", background: "#E1F5EE", fontSize: 11, fontWeight: 500, color: "#0F6E56" }}><span>Kod</span><span>Hesap</span><span style={{ textAlign: "right" }}>{d1}</span><span style={{ textAlign: "right" }}>{d2}</span><span style={{ textAlign: "right" }}>Azalis</span><span style={{ textAlign: "right" }}>%</span></div>
+              <div style={{ display: "grid", gridTemplateColumns: "0.8fr 2fr 1fr 1fr 1fr 0.7fr", padding: "8px 12px", background: "var(--color-background-success)", fontSize: 11, fontWeight: 500, color: "var(--color-text-success)" }}><span>Kod</span><span>Hesap</span><span style={{ textAlign: "right" }}>{d1}</span><span style={{ textAlign: "right" }}>{d2}</span><span style={{ textAlign: "right" }}>Azalis</span><span style={{ textAlign: "right" }}>%</span></div>
               {topAzalis.map((item, idx) => (
                 <div key={item.kod + "-" + idx} style={{ display: "grid", gridTemplateColumns: "0.8fr 2fr 1fr 1fr 1fr 0.7fr", padding: "8px 12px", borderBottom: "0.5px solid var(--color-border-tertiary)", fontSize: 13 }}>
                   <span style={{ fontSize: 11, color: "var(--color-text-tertiary)" }}>{item.kod}</span>
                   <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{item.ad}</span>
                   <span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatN(item.vS)}</span>
                   <span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums", color: "var(--color-text-secondary)" }}>{formatN(item.vK)}</span>
-                  <span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums", color: "#0F6E56", fontWeight: 500 }}>{formatN(item.fark)}</span>
-                  <span style={{ textAlign: "right" }}><span style={{ fontSize: 11, padding: "2px 6px", borderRadius: 99, background: "#E1F5EE", color: "#0F6E56", fontWeight: 500 }}>{item.pct.toFixed(0)}%</span></span>
+                  <span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums", color: "var(--color-text-success)", fontWeight: 500 }}>{formatN(item.fark)}</span>
+                  <span style={{ textAlign: "right" }}><span style={{ fontSize: 11, padding: "2px 6px", borderRadius: 99, background: "var(--color-background-success)", color: "var(--color-text-success)", fontWeight: 500 }}>{item.pct.toFixed(0)}%</span></span>
                 </div>
               ))}
             </div>
@@ -2732,7 +2934,7 @@ export default function App() {
           {(yeniKalemler.length > 0 || kaybolan.length > 0) && (
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: "1.5rem" }}>
               {yeniKalemler.length > 0 && (<div style={{ border: "0.5px solid var(--color-border-tertiary)", borderRadius: 14, overflow: "hidden" }}>
-                <div style={{ padding: "10px 14px", background: "#FAEEDA", fontWeight: 500, fontSize: 13, color: "#BA7517" }}>Yeni gider kalemleri ({yeniKalemler.length})</div>
+                <div style={{ padding: "10px 14px", background: "var(--color-background-warning)", fontWeight: 500, fontSize: 13, color: "var(--color-text-warning)" }}>Yeni gider kalemleri ({yeniKalemler.length})</div>
                 {yeniKalemler.slice(0, 10).map((item) => (
                   <div key={item.kod} style={{ display: "flex", justifyContent: "space-between", padding: "7px 14px", borderBottom: "0.5px solid var(--color-border-tertiary)", fontSize: 12 }}>
                     <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}><span style={{ color: "var(--color-text-tertiary)", fontSize: 10 }}>{item.kod}</span> {item.ad}</span>
@@ -2765,7 +2967,7 @@ export default function App() {
                     <span style={{ fontSize: 14, fontWeight: 500 }}>{grp.kod} {grp.ad}</span>
                     <span style={{ textAlign: "right", fontSize: 13, fontWeight: 500, fontVariantNumeric: "tabular-nums" }}>{formatN(grp.totalS)}</span>
                     <span style={{ textAlign: "right", fontSize: 13, color: "var(--color-text-secondary)", fontVariantNumeric: "tabular-nums" }}>{formatN(grp.totalK)}</span>
-                    <span style={{ textAlign: "right", fontSize: 13, fontWeight: 500, color: grp.fark > 0 ? "#A32D2D" : "#0F6E56", fontVariantNumeric: "tabular-nums" }}>{grp.fark > 0 ? "+" : ""}{formatN(grp.fark)}</span>
+                    <span style={{ textAlign: "right", fontSize: 13, fontWeight: 500, color: grp.fark > 0 ? "var(--color-text-danger)" : "var(--color-text-success)", fontVariantNumeric: "tabular-nums" }}>{grp.fark > 0 ? "+" : ""}{formatN(grp.fark)}</span>
                     <span style={{ textAlign: "right" }}><Badge val={grpPct} /></span>
                   </div>
                   {isOpen && (
@@ -2775,8 +2977,8 @@ export default function App() {
                         <div key={item.kod} style={{ display: "grid", gridTemplateColumns: "2.5fr 1fr 1fr 1fr 0.7fr", padding: "6px 14px 6px 34px", borderBottom: "0.5px solid var(--color-border-tertiary)", fontSize: 12, background: Math.abs(item.fark) > 50000 ? (item.fark > 0 ? "rgba(163,45,45,0.03)" : "rgba(15,110,86,0.03)") : "transparent" }}>
                           <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={item.ad}><span style={{ color: "var(--color-text-tertiary)", fontSize: 10 }}>{item.kod}</span> {item.ad}</span>
                           <span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatN(item.vS)}</span>
-                          <span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums", color: "var(--color-text-secondary)" }}>{item.vK !== 0 ? formatN(item.vK) : <span style={{ fontSize: 10, color: "#BA7517" }}>YENİ</span>}</span>
-                          <span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums", fontWeight: 500, color: item.fark > 0 ? "#A32D2D" : item.fark < 0 ? "#0F6E56" : "var(--color-text-tertiary)" }}>{item.fark > 0 ? "+" : ""}{formatN(item.fark)}</span>
+                          <span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums", color: "var(--color-text-secondary)" }}>{item.vK !== 0 ? formatN(item.vK) : <span style={{ fontSize: 10, color: "var(--color-text-warning)" }}>YENİ</span>}</span>
+                          <span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums", fontWeight: 500, color: item.fark > 0 ? "var(--color-text-danger)" : item.fark < 0 ? "var(--color-text-success)" : "var(--color-text-tertiary)" }}>{item.fark > 0 ? "+" : ""}{formatN(item.fark)}</span>
                           <span style={{ textAlign: "right" }}><Badge val={item.pct} /></span>
                         </div>
                       ))}
@@ -2792,7 +2994,7 @@ export default function App() {
             <span>TOPLAM GIDERLER</span>
             <span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatN(toplamS)}</span>
             <span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums", color: "var(--color-text-secondary)" }}>{formatN(toplamK)}</span>
-            <span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums", color: toplamS - toplamK > 0 ? "#A32D2D" : "#0F6E56" }}>{toplamS - toplamK > 0 ? "+" : ""}{formatN(toplamS - toplamK)}</span>
+            <span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums", color: toplamS - toplamK > 0 ? "var(--color-text-danger)" : "var(--color-text-success)" }}>{toplamS - toplamK > 0 ? "+" : ""}{formatN(toplamS - toplamK)}</span>
             <span style={{ textAlign: "right" }}><Badge val={toplamK !== 0 ? ((toplamS - toplamK) / Math.abs(toplamK) * 100) : 0} /></span>
           </div>
         </div>);
@@ -2855,9 +3057,9 @@ export default function App() {
           setGvDilimler((p) => p.map((d, i) => i === idx ? { ...d, [field]: field === "oran" ? (parseFloat(val) || 0) : (parseFloat(val.replace(/\./g, "").replace(",", ".")) || 0) } : d));
         };
 
-        const mStyle = { padding: "8px 12px", fontSize: 14, fontWeight: 500, border: "2px solid #185FA5", borderRadius: "var(--border-radius-md)", background: "#E6F1FB", color: "#185FA5", textAlign: "right", width: 140, fontVariantNumeric: "tabular-nums", outline: "none" };
+        const mStyle = { padding: "8px 12px", fontSize: 14, fontWeight: 500, border: "2px solid var(--color-text-info)", borderRadius: "var(--border-radius-md)", background: "var(--color-background-info)", color: "var(--color-text-info)", textAlign: "right", width: 140, fontVariantNumeric: "tabular-nums", outline: "none" };
         const mOranStyle = { ...mStyle, width: 50, textAlign: "center" };
-        const mBadge = <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 99, background: "#E6F1FB", color: "#185FA5", fontWeight: 500, marginLeft: 6 }}>GIRIS</span>;
+        const mBadge = <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 99, background: "var(--color-background-info)", color: "var(--color-text-info)", fontWeight: 500, marginLeft: 6 }}>GIRIS</span>;
         const rowM = "rgba(24,95,165,0.04)";
         const secStyle = { fontSize: 16, fontWeight: 500, color: "var(--color-text-primary)", margin: "1.5rem 0 0.75rem", paddingBottom: 6, borderBottom: "0.5px solid var(--color-border-tertiary)" };
         const sumRow = (label, val, color) => (<div style={{ display: "flex", justifyContent: "space-between", padding: "12px 16px", borderBottom: "0.5px solid var(--color-border-tertiary)" }}><span style={{ fontSize: 14 }}>{label}</span><span style={{ fontSize: 16, fontWeight: 600, color: color || "var(--color-text-primary)", fontVariantNumeric: "tabular-nums" }}>{formatN(val)}</span></div>);
@@ -2869,7 +3071,7 @@ export default function App() {
           {/* Gecici Vergi Orani */}
           <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: "1.5rem", padding: "12px 16px", background: "var(--color-background-secondary)", borderRadius: "var(--border-radius-md)" }}>
             <span style={{ fontSize: 13, color: "var(--color-text-secondary)" }}>Gecici vergi orani:</span>
-            <span style={{ fontSize: 14, fontWeight: 600, color: "#185FA5" }}>%</span>
+            <span style={{ fontSize: 14, fontWeight: 600, color: "var(--color-text-info)" }}>%</span>
             <input type="text" value={gvGeciciOran} onChange={(e) => setGvGeciciOran(e.target.value.replace(/[^0-9.,]/g, ""))} style={mOranStyle} />
             {mBadge}
           </div>
@@ -2888,7 +3090,7 @@ export default function App() {
                 <span style={{ fontSize: 13, fontWeight: 500 }}>{gvCeyrekler[i].ad}</span>
                 <span style={{ textAlign: "right" }}><input type="text" value={gvCeyrekler[i].matrah} onChange={(e) => updateCeyrek(i, "matrah", e.target.value)} placeholder="0" style={{ ...mStyle, width: 120 }} /></span>
                 <span style={{ textAlign: "right", fontSize: 13, color: "var(--color-text-secondary)", fontVariantNumeric: "tabular-nums" }}>{formatN(c.ceyrekMatrah)}</span>
-                <span style={{ textAlign: "right", fontSize: 13, fontWeight: 500, color: "#A32D2D", fontVariantNumeric: "tabular-nums" }}>{formatN(c.ceyrekVergi)}</span>
+                <span style={{ textAlign: "right", fontSize: 13, fontWeight: 500, color: "var(--color-text-danger)", fontVariantNumeric: "tabular-nums" }}>{formatN(c.ceyrekVergi)}</span>
                 <span style={{ textAlign: "right" }}><input type="text" value={gvCeyrekler[i].odenen} onChange={(e) => updateCeyrek(i, "odenen", e.target.value)} placeholder="0" style={{ ...mStyle, width: 120 }} /></span>
               </div>
             ))}
@@ -2896,8 +3098,8 @@ export default function App() {
               <span>YILLIK</span>
               <span style={{ textAlign: "right" }}>{formatN(sonKumMatrah)}</span>
               <span style={{ textAlign: "right" }}>{formatN(sonKumMatrah)}</span>
-              <span style={{ textAlign: "right", color: "#A32D2D" }}>{formatN(sonKumMatrah * (geciciOranVal / 100))}</span>
-              <span style={{ textAlign: "right", color: "#0F6E56" }}>{formatN(toplamOdenen)}</span>
+              <span style={{ textAlign: "right", color: "var(--color-text-danger)" }}>{formatN(sonKumMatrah * (geciciOranVal / 100))}</span>
+              <span style={{ textAlign: "right", color: "var(--color-text-success)" }}>{formatN(toplamOdenen)}</span>
             </div>
           </div>
 
@@ -2910,12 +3112,12 @@ export default function App() {
             </div>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "12px 16px", borderBottom: "0.5px solid var(--color-border-tertiary)", background: rowM }}>
               <div style={{ display: "flex", alignItems: "center", gap: 6 }}><span style={{ fontSize: 14 }}>Bag-Kur odeme indirimi</span>{mBadge}</div>
-              <input type="text" value={gvBagkur} onChange={(e) => setGvBagkur(formatInput(e.target.value))} placeholder="Tutar girin" style={{ padding: "10px 14px", fontSize: 15, fontWeight: 500, border: "2px solid #185FA5", borderRadius: "var(--border-radius-md)", background: "#E6F1FB", color: "#185FA5", textAlign: "right", width: 160, fontVariantNumeric: "tabular-nums", outline: "none" }} />
+              <input type="text" value={gvBagkur} onChange={(e) => setGvBagkur(formatInput(e.target.value))} placeholder="Tutar girin" style={{ padding: "10px 14px", fontSize: 15, fontWeight: 500, border: "2px solid var(--color-text-info)", borderRadius: "var(--border-radius-md)", background: "var(--color-background-info)", color: "var(--color-text-info)", textAlign: "right", width: 160, fontVariantNumeric: "tabular-nums", outline: "none" }} />
             </div>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "12px 16px", borderBottom: "0.5px solid var(--color-border-tertiary)", background: rowM }}>
               <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                 <span style={{ fontSize: 14 }}>Hata payi</span>
-                <span style={{ fontSize: 13, fontWeight: 600, color: "#185FA5" }}>%</span>
+                <span style={{ fontSize: 13, fontWeight: 600, color: "var(--color-text-info)" }}>%</span>
                 <input type="text" value={gvHataPayi} onChange={(e) => setGvHataPayi(e.target.value.replace(/[^0-9.,]/g, ""))} style={mOranStyle} />
                 {mBadge}
               </div>
@@ -2923,7 +3125,7 @@ export default function App() {
             </div>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "12px 16px", borderBottom: "0.5px solid var(--color-border-tertiary)", background: "var(--color-background-secondary)" }}>
               <span style={{ fontSize: 14, fontWeight: 500 }}>Toplam indirim</span>
-              <span style={{ fontSize: 14, fontWeight: 600, color: "#0F6E56", fontVariantNumeric: "tabular-nums" }}>-{formatN(toplamIndirim)}</span>
+              <span style={{ fontSize: 14, fontWeight: 600, color: "var(--color-text-success)", fontVariantNumeric: "tabular-nums" }}>-{formatN(toplamIndirim)}</span>
             </div>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "14px 16px", background: "var(--color-background-secondary)" }}>
               <span style={{ fontSize: 15, fontWeight: 600 }}>Vergiye tabi matrah</span>
@@ -2948,7 +3150,7 @@ export default function App() {
             <div style={{ display: "grid", gridTemplateColumns: "1fr 0.5fr 1fr 1fr", padding: "12px 14px", background: "var(--color-background-secondary)", fontWeight: 600, fontSize: 14 }}>
               <span>TOPLAM</span><span></span>
               <span style={{ textAlign: "right" }}>{formatN(vergiMatrahi)}</span>
-              <span style={{ textAlign: "right", color: "#A32D2D" }}>{formatN(gv.toplam)}</span>
+              <span style={{ textAlign: "right", color: "var(--color-text-danger)" }}>{formatN(gv.toplam)}</span>
             </div>
           </div>
 
@@ -2957,20 +3159,20 @@ export default function App() {
           <div style={{ border: "0.5px solid var(--color-border-tertiary)", borderRadius: 14, overflow: "hidden", marginBottom: "1.5rem" }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "12px 16px", borderBottom: "0.5px solid var(--color-border-tertiary)" }}>
               <span style={{ fontSize: 14 }}>Hesaplanan gelir vergisi</span>
-              <span style={{ fontSize: 16, fontWeight: 600, color: "#A32D2D", fontVariantNumeric: "tabular-nums" }}>{formatN(gv.toplam)}</span>
+              <span style={{ fontSize: 16, fontWeight: 600, color: "var(--color-text-danger)", fontVariantNumeric: "tabular-nums" }}>{formatN(gv.toplam)}</span>
             </div>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "12px 16px", borderBottom: "0.5px solid var(--color-border-tertiary)", background: rowM }}>
               <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                 <span style={{ fontSize: 14 }}>Vergi Indirimi (GVK Mk. 121)</span>
-                <span style={{ fontSize: 13, fontWeight: 600, color: "#185FA5" }}>%</span>
+                <span style={{ fontSize: 13, fontWeight: 600, color: "var(--color-text-info)" }}>%</span>
                 <input type="text" value={gvVergiIndirimi} onChange={(e) => setGvVergiIndirimi(e.target.value.replace(/[^0-9.,]/g, ""))} style={mOranStyle} />
                 {mBadge}
               </div>
-              <span style={{ fontSize: 14, fontWeight: 500, color: "#0F6E56", fontVariantNumeric: "tabular-nums" }}>-{formatN(vergiIndirimTutar)}</span>
+              <span style={{ fontSize: 14, fontWeight: 500, color: "var(--color-text-success)", fontVariantNumeric: "tabular-nums" }}>-{formatN(vergiIndirimTutar)}</span>
             </div>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "14px 16px", background: "var(--color-background-secondary)" }}>
               <span style={{ fontSize: 15, fontWeight: 600 }}>Odenecek net gelir vergisi</span>
-              <span style={{ fontSize: 18, fontWeight: 700, color: "#A32D2D", fontVariantNumeric: "tabular-nums" }}>{formatN(netVergi)}</span>
+              <span style={{ fontSize: 18, fontWeight: 700, color: "var(--color-text-danger)", fontVariantNumeric: "tabular-nums" }}>{formatN(netVergi)}</span>
             </div>
           </div>
 
@@ -2978,23 +3180,115 @@ export default function App() {
           <div style={secStyle}>Nihai sonuc</div>
           <div style={{ border: "0.5px solid var(--color-border-tertiary)", borderRadius: 14, overflow: "hidden", marginBottom: "1.5rem" }}>
             {sumRow("Yillik matrah (kumulatif)", sonKumMatrah)}
-            {sumRow("(-) Bag-Kur indirimi", bagkurVal, "#0F6E56")}
-            {sumRow("(-) Hata payi (%" + hataPayiOran + ")", hataPayiTutar, "#0F6E56")}
+            {sumRow("(-) Bag-Kur indirimi", bagkurVal, "var(--color-text-success)")}
+            {sumRow("(-) Hata payi (%" + hataPayiOran + ")", hataPayiTutar, "var(--color-text-success)")}
             {sumRow("Vergiye tabi matrah", vergiMatrahi)}
-            {sumRow("Hesaplanan gelir vergisi (dilimlerle)", gv.toplam, "#A32D2D")}
-            {sumRow("(-) Vergi indirimi GVK 121 (%" + vergiIndirimOran + ")", vergiIndirimTutar, "#0F6E56")}
-            {sumRow("Odenecek net gelir vergisi", netVergi, "#A32D2D")}
-            {sumRow("(-) Yil ici odenen gecici vergi", toplamOdenen, "#0F6E56")}
-            <div style={{ display: "flex", justifyContent: "space-between", padding: "16px", background: kalanOdenecek > 0 ? "#FCEBEB" : "#E1F5EE" }}>
+            {sumRow("Hesaplanan gelir vergisi (dilimlerle)", gv.toplam, "var(--color-text-danger)")}
+            {sumRow("(-) Vergi indirimi GVK 121 (%" + vergiIndirimOran + ")", vergiIndirimTutar, "var(--color-text-success)")}
+            {sumRow("Odenecek net gelir vergisi", netVergi, "var(--color-text-danger)")}
+            {sumRow("(-) Yil ici odenen gecici vergi", toplamOdenen, "var(--color-text-success)")}
+            <div style={{ display: "flex", justifyContent: "space-between", padding: "16px", background: kalanOdenecek > 0 ? "var(--color-background-danger)" : "var(--color-background-success)" }}>
               <span style={{ fontSize: 16, fontWeight: 700 }}>{kalanOdenecek > 0 ? "ODENECEK GELIR VERGISI" : "IADE ALINACAK"}</span>
-              <span style={{ fontSize: 24, fontWeight: 700, color: kalanOdenecek > 0 ? "#A32D2D" : "#0F6E56", fontVariantNumeric: "tabular-nums" }}>{formatN(Math.abs(kalanOdenecek))}</span>
+              <span style={{ fontSize: 24, fontWeight: 700, color: kalanOdenecek > 0 ? "var(--color-text-danger)" : "var(--color-text-success)", fontVariantNumeric: "tabular-nums" }}>{formatN(Math.abs(kalanOdenecek))}</span>
             </div>
           </div>
 
           <div style={{ padding: "12px 16px", background: "var(--color-background-secondary)", borderRadius: "var(--border-radius-md)", fontSize: 12, color: "var(--color-text-secondary)", lineHeight: 1.7 }}>
-            <span style={{ display: "inline-block", fontSize: 10, padding: "2px 8px", borderRadius: 99, background: "#E6F1FB", color: "#185FA5", fontWeight: 500, marginRight: 6 }}>GIRIS</span>
+            <span style={{ display: "inline-block", fontSize: 10, padding: "2px 8px", borderRadius: 99, background: "var(--color-background-info)", color: "var(--color-text-info)", fontWeight: 500, marginRight: 6 }}>GIRIS</span>
             Kumulatif matrah her ceyrekte ocaktan o ayin sonuna kadar girilir. Bag-Kur indirimi yillik odenen tutari giriniz. Hata payi varsayilan %9, Vergi Indirimi (GVK Mk. 121) varsayilan %5'tir — degistirilebilir. Dilimler 2025 resmi tarifesidir.
           </div>
+        </div>);
+      })()}
+
+      {/* TAB 12: Yapay zeka yorumu */}
+      {tab === 12 && g && (() => {
+        const hazir = aiDurum && aiDurum.durum === "hazir";
+        const kontrolSay = (kontroller[sel] || []).filter((k) => k.seviye !== "bilgi").length;
+        const goster = aiMesajlar.slice(1);
+        const chip = (on) => ({ padding: "7px 14px", fontSize: 12.5, borderRadius: 99, cursor: "pointer", fontWeight: on ? 600 : 500, background: on ? "var(--color-background-info)" : "var(--color-background-primary)", color: on ? "var(--color-text-info)" : "var(--color-text-secondary)", border: "0.5px solid " + (on ? "var(--color-border-info)" : "var(--color-border-tertiary)") });
+        const btn = { padding: "10px 18px", fontSize: 14, fontWeight: 600, borderRadius: 10, border: "none", cursor: "pointer", background: "var(--color-text-info)", color: "var(--color-background-primary)" };
+        const btn2 = { padding: "8px 14px", fontSize: 12.5, fontWeight: 500, borderRadius: 99, cursor: "pointer", background: "transparent", color: "var(--color-text-secondary)", border: "0.5px solid var(--color-border-tertiary)" };
+        return (<div>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12, marginBottom: "1rem" }}>
+            <div>
+              <div style={{ fontSize: 20, fontWeight: 600 }}>Yapay zeka yorumu</div>
+              <div style={{ fontSize: 13, color: "var(--color-text-secondary)" }}>{d1}{karsiList.length ? " + " + karsiList.length + " karsilastirma donemi" : ""}</div>
+            </div>
+            {aiSon && !ai.loading && <div style={{ display: "flex", gap: 8 }}>
+              <button onClick={() => aiKopyala(aiSon.content)} style={DL_STYLE}>Kopyala</button>
+              <button onClick={() => exportFullHTML(g, gK, b, bK, a, rapor, d1, d2, kontroller[sel], aiSon.content)} style={{ ...DL_STYLE, background: "var(--color-background-success)", color: "var(--color-text-success)", border: "0.5px solid var(--color-border-success)" }}>Rapor + yorum (HTML)</button>
+            </div>}
+          </div>
+
+          <div style={{ padding: "14px 16px", borderRadius: 14, background: "var(--color-background-secondary)", marginBottom: "1rem", fontSize: 13, lineHeight: 1.7, color: "var(--color-text-secondary)" }}>
+            Programin hesapladigi gelir tablosu, bilanco ozeti, oranlar, ana hesap bakiyeleri, en buyuk gider kalemleri ve veri kontrolleri yapay zekaya (Claude) gonderilir; bir mali musavir gozuyle yorumlanir.
+            <b style={{ color: "var(--color-text-primary)" }}> Musteri, tedarikci ve personel isimlerinin bulundugu alt hesaplar gonderilmez.</b>
+            {kontrolSay > 0 && <div style={{ marginTop: 6, color: "var(--color-text-warning)" }}>Bu donemde {kontrolSay} veri kontrolu uyarisi var; yorum bunlari dikkate alacak.</div>}
+          </div>
+
+          <div style={{ fontSize: 13, fontWeight: 500, marginBottom: 8 }}>Odak</div>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: "1rem" }}>
+            {ODAKLAR.filter((o) => o.id !== "karsilastirma" || karsiList.length).map((o) => <button key={o.id} onClick={() => setAiOdak(o.id)} style={chip(aiOdak === o.id)}>{o.ad}</button>)}
+          </div>
+
+          {!aiDurum && <div style={{ fontSize: 13, color: "var(--color-text-tertiary)", marginBottom: "1rem" }}>Yapay zeka sunucusu kontrol ediliyor...</div>}
+
+          {hazir && (<div style={{ marginBottom: "1.25rem" }}>
+            {aiDurum.kodGerekli && (<div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 10, flexWrap: "wrap" }}>
+              <span style={{ fontSize: 13, color: "var(--color-text-secondary)" }}>Erisim kodu</span>
+              <input type="password" value={aiKod} onChange={(e) => { setAiKod(e.target.value); try { localStorage.setItem("fa-ai-kod", e.target.value); } catch (er) { /* yoksay */ } }} placeholder="Kod" style={{ padding: "8px 12px", fontSize: 14, borderRadius: 8, border: "0.5px solid var(--color-border-secondary)", background: "var(--color-background-primary)", color: "var(--color-text-primary)", width: 150 }} />
+            </div>)}
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              {!ai.loading && <button data-ai="baslat" onClick={aiBaslat} style={btn}>{aiSon ? "Yeniden yorumla" : "Yorumla"}</button>}
+              {ai.loading && <button onClick={aiDurdur} style={{ ...btn, background: "var(--color-background-danger)", color: "var(--color-text-danger)" }}>Durdur</button>}
+              <button onClick={aiClaudeda} style={btn2}>Claude'da ac</button>
+            </div>
+          </div>)}
+
+          {aiDurum && !hazir && (<div style={{ padding: "16px", borderRadius: 14, border: "0.5px solid var(--color-border-info)", background: "var(--color-background-primary)", marginBottom: "1.25rem" }}>
+            <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 6 }}>Claude ile yorumlatin</div>
+            <div style={{ fontSize: 13, color: "var(--color-text-secondary)", lineHeight: 1.7, marginBottom: 12 }}>
+              Dugmeye basinca talimat ve veri panoya kopyalanir, Claude yeni sekmede acilir. Yeni sohbete yapistirip gonderin. Claude hesabiniz yeterli.
+            </div>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              <button data-ai="claude" onClick={aiClaudeda} style={btn}>Kopyala ve Claude'u ac</button>
+              <button onClick={aiMetniIndir} style={btn2}>Metni indir (.txt)</button>
+            </div>
+            <details style={{ marginTop: 14 }}>
+              <summary style={{ fontSize: 12.5, color: "var(--color-text-tertiary)", cursor: "pointer" }}>Yorum uygulamanin icinde gorunsun (bir kerelik kurulum)</summary>
+              <div style={{ fontSize: 12.5, color: "var(--color-text-secondary)", lineHeight: 1.8, marginTop: 8 }}>
+                1. console.anthropic.com adresinden bir API anahtari olusturun (kullandikca ucretlendirilir).<br />
+                2. Vercel'de projenizi acin: Settings &gt; Environment Variables.<br />
+                3. <code>ANTHROPIC_API_KEY</code> adiyla anahtari ekleyin. Baskalari kullanamasin diye <code>APP_ACCESS_CODE</code> adiyla bir erisim kodu da ekleyin.<br />
+                4. Deployments sekmesinden son yayini "Redeploy" edin. Bu sayfada "Yorumla" dugmesi belirecek.
+                {aiDurum.durum === "sunucu-yok" && <div style={{ marginTop: 6, color: "var(--color-text-tertiary)" }}>(Yorum sunucusuna ulasilamadi: internet yok veya uygulama Vercel disinda calisiyor.)</div>}
+              </div>
+            </details>
+          </div>)}
+
+          {ai.error && <div style={{ padding: "12px 16px", borderRadius: 10, background: "var(--color-background-danger)", color: "var(--color-text-danger)", fontSize: 13, marginBottom: "1rem" }}>{ai.error}</div>}
+
+          {/* Konusma */}
+          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+            {goster.map((m, i) => m.role === "user"
+              ? <div key={i} style={{ alignSelf: "flex-end", maxWidth: "85%", padding: "10px 14px", borderRadius: "14px 14px 4px 14px", background: "var(--color-background-info)", color: "var(--color-text-primary)", fontSize: 14, lineHeight: 1.6, whiteSpace: "pre-wrap" }}>{m.content}</div>
+              : <div key={i} className="fa-md" data-ai-cevap style={{ padding: "16px 18px", borderRadius: 14, border: "0.5px solid var(--color-border-tertiary)", background: "var(--color-background-primary)" }} dangerouslySetInnerHTML={{ __html: mdToHtml(m.content) }} />)}
+            {ai.loading && <div className="fa-md" style={{ padding: "16px 18px", borderRadius: 14, border: "0.5px solid var(--color-border-info)", background: "var(--color-background-primary)" }}>
+              {ai.text ? <div dangerouslySetInnerHTML={{ __html: mdToHtml(ai.text) }} /> : <div style={{ fontSize: 13, color: "var(--color-text-tertiary)" }}>Yorum hazirlaniyor...</div>}
+            </div>}
+          </div>
+
+          {hazir && aiSon && (<div style={{ display: "flex", gap: 8, marginTop: 14 }}>
+            <input value={aiSoru} onChange={(e) => setAiSoru(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") aiSor(); }} placeholder="Bu analizle ilgili bir soru sorun (orn. Stok devir suresi neden bu kadar uzun?)" disabled={ai.loading} style={{ flex: 1, minWidth: 0, padding: "11px 14px", fontSize: 14, borderRadius: 10, border: "0.5px solid var(--color-border-secondary)", background: "var(--color-background-primary)", color: "var(--color-text-primary)" }} />
+            <button onClick={aiSor} disabled={ai.loading || !aiSoru.trim()} style={{ ...btn, opacity: ai.loading || !aiSoru.trim() ? 0.5 : 1 }}>Sor</button>
+          </div>)}
+
+          {aiSon && <div style={{ fontSize: 11.5, color: "var(--color-text-tertiary)", marginTop: 12, lineHeight: 1.6 }}>Yapay zeka yorumudur; vergi ve hukuki kararlardan once uzman kontrolu onerilir.</div>}
+
+          <details style={{ marginTop: "1.5rem" }}>
+            <summary style={{ fontSize: 12.5, color: "var(--color-text-tertiary)", cursor: "pointer" }}>Gonderilecek veriyi goster</summary>
+            <pre style={{ marginTop: 8, padding: 12, borderRadius: 10, background: "var(--color-background-secondary)", fontSize: 11, lineHeight: 1.5, overflow: "auto", maxHeight: 360, whiteSpace: "pre-wrap", color: "var(--color-text-secondary)" }}>{aiData}</pre>
+          </details>
         </div>);
       })()}
 
@@ -3048,7 +3342,7 @@ export default function App() {
           return (<div style={{ display: "grid", gridTemplateColumns: hasK2 ? "2.2fr 1fr 1fr 1fr 0.7fr" : "2.5fr 1fr", padding: sub ? "5px 14px 5px 34px" : "8px 14px", borderBottom: "0.5px solid var(--color-border-tertiary)", fontWeight: bold ? 600 : 400, fontSize: sub ? 12 : 14, color: sub ? "var(--color-text-secondary)" : "var(--color-text-primary)", background: hl ? "var(--color-background-secondary)" : "transparent" }}>
             <span>{label}</span>
             <span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatN(val)}</span>
-            {hasK2 && <><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums", color: "var(--color-text-secondary)" }}>{formatN(valK)}</span><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums", color: val - valK >= 0 ? "#0F6E56" : "#A32D2D" }}>{val - valK >= 0 ? "+" : ""}{formatN(val - valK)}</span><span style={{ textAlign: "right" }}><Badge val={degFn(val, valK)} /></span></>}
+            {hasK2 && <><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums", color: "var(--color-text-secondary)" }}>{formatN(valK)}</span><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums", color: val - valK >= 0 ? "var(--color-text-success)" : "var(--color-text-danger)" }}>{val - valK >= 0 ? "+" : ""}{formatN(val - valK)}</span><span style={{ textAlign: "right" }}><Badge val={degFn(val, valK)} /></span></>}
           </div>);
         };
 
@@ -3066,25 +3360,25 @@ export default function App() {
               <div style={{ fontSize: 18, fontWeight: 600, fontVariantNumeric: "tabular-nums" }}>{formatN(satisMatrah)}</div>
             </div>
             <div style={{ padding: 16, borderRadius: 14, background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-tertiary)", position: "relative", overflow: "hidden" }}>
-              <div style={{ position: "absolute", top: 0, left: 0, width: "100%", height: 3, background: "#A32D2D" }} />
+              <div style={{ position: "absolute", top: 0, left: 0, width: "100%", height: 3, background: "var(--color-text-danger)" }} />
               <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginBottom: 4 }}>Hesaplanan KDV</div>
-              <div style={{ fontSize: 18, fontWeight: 600, color: "#A32D2D", fontVariantNumeric: "tabular-nums" }}>{formatN(hesaplananTop)}</div>
+              <div style={{ fontSize: 18, fontWeight: 600, color: "var(--color-text-danger)", fontVariantNumeric: "tabular-nums" }}>{formatN(hesaplananTop)}</div>
             </div>
             <div style={{ padding: 16, borderRadius: 14, background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-tertiary)", position: "relative", overflow: "hidden" }}>
-              <div style={{ position: "absolute", top: 0, left: 0, width: "100%", height: 3, background: "#0F6E56" }} />
+              <div style={{ position: "absolute", top: 0, left: 0, width: "100%", height: 3, background: "var(--color-text-success)" }} />
               <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginBottom: 4 }}>Indirilecek KDV</div>
-              <div style={{ fontSize: 18, fontWeight: 600, color: "#0F6E56", fontVariantNumeric: "tabular-nums" }}>{formatN(indirilecekTop)}</div>
+              <div style={{ fontSize: 18, fontWeight: 600, color: "var(--color-text-success)", fontVariantNumeric: "tabular-nums" }}>{formatN(indirilecekTop)}</div>
             </div>
-            <div style={{ padding: 16, borderRadius: 14, background: odenecek > 0 ? "#FCEBEB" : "#E1F5EE", border: "0.5px solid var(--color-border-tertiary)", position: "relative", overflow: "hidden" }}>
-              <div style={{ position: "absolute", top: 0, left: 0, width: "100%", height: 3, background: odenecek > 0 ? "#A32D2D" : "#0F6E56" }} />
+            <div style={{ padding: 16, borderRadius: 14, background: odenecek > 0 ? "var(--color-background-danger)" : "var(--color-background-success)", border: "0.5px solid var(--color-border-tertiary)", position: "relative", overflow: "hidden" }}>
+              <div style={{ position: "absolute", top: 0, left: 0, width: "100%", height: 3, background: odenecek > 0 ? "var(--color-text-danger)" : "var(--color-text-success)" }} />
               <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginBottom: 4 }}>{odenecek > 0 ? "Odenecek KDV" : "Devreden KDV"}</div>
-              <div style={{ fontSize: 18, fontWeight: 600, color: odenecek > 0 ? "#A32D2D" : "#0F6E56", fontVariantNumeric: "tabular-nums" }}>{formatN(odenecek > 0 ? odenecek : sonrakiDevreden)}</div>
+              <div style={{ fontSize: 18, fontWeight: 600, color: odenecek > 0 ? "var(--color-text-danger)" : "var(--color-text-success)", fontVariantNumeric: "tabular-nums" }}>{formatN(odenecek > 0 ? odenecek : sonrakiDevreden)}</div>
             </div>
           </div>
 
           {/* Hesaplanan KDV Detay */}
           <div style={{ border: "0.5px solid var(--color-border-tertiary)", borderRadius: 14, overflow: "hidden", marginBottom: 16 }}>
-            <div style={{ padding: "10px 14px", background: "#FCEBEB", color: "#A32D2D", fontWeight: 500, fontSize: 14 }}>Hesaplanan KDV (391)</div>
+            <div style={{ padding: "10px 14px", background: "var(--color-background-danger)", color: "var(--color-text-danger)", fontWeight: 500, fontSize: 14 }}>Hesaplanan KDV (391)</div>
             {hasK && <div style={{ display: "grid", gridTemplateColumns: "2.2fr 1fr 1fr 1fr 0.7fr", padding: "6px 14px", background: "var(--color-background-secondary)", fontSize: 11, fontWeight: 500, color: "var(--color-text-secondary)" }}><span>Hesap</span><span style={{ textAlign: "right" }}>{d1}</span><span style={{ textAlign: "right" }}>{d2}</span><span style={{ textAlign: "right" }}>Fark</span><span style={{ textAlign: "right" }}>%</span></div>}
             {hesaplananSubs.map((s) => { const kItem = hesaplananKSubs.find((k) => k.kod === s.kod); return <KDVRow key={s.kod} label={s.kod + " " + s.ad} val={s.val} valK={kItem ? kItem.val : (hasK ? 0 : null)} sub />; })}
             <KDVRow label="TOPLAM HESAPLANAN KDV" val={hesaplananTop} valK={hesaplananKTop} bold hl />
@@ -3092,7 +3386,7 @@ export default function App() {
 
           {/* Indirilecek KDV Detay */}
           <div style={{ border: "0.5px solid var(--color-border-tertiary)", borderRadius: 14, overflow: "hidden", marginBottom: 16 }}>
-            <div style={{ padding: "10px 14px", background: "#E1F5EE", color: "#0F6E56", fontWeight: 500, fontSize: 14 }}>Indirilecek KDV (191)</div>
+            <div style={{ padding: "10px 14px", background: "var(--color-background-success)", color: "var(--color-text-success)", fontWeight: 500, fontSize: 14 }}>Indirilecek KDV (191)</div>
             {hasK && <div style={{ display: "grid", gridTemplateColumns: "2.2fr 1fr 1fr 1fr 0.7fr", padding: "6px 14px", background: "var(--color-background-secondary)", fontSize: 11, fontWeight: 500, color: "var(--color-text-secondary)" }}><span>Hesap</span><span style={{ textAlign: "right" }}>{d1}</span><span style={{ textAlign: "right" }}>{d2}</span><span style={{ textAlign: "right" }}>Fark</span><span style={{ textAlign: "right" }}>%</span></div>}
             {indirilecekSubs.map((s) => { const kItem = indirilecekKSubs.find((k) => k.kod === s.kod); return <KDVRow key={s.kod} label={s.kod + " " + s.ad} val={s.val} valK={kItem ? kItem.val : (hasK ? 0 : null)} sub />; })}
             <KDVRow label="TOPLAM INDIRILECEK KDV" val={indirilecekTop} valK={indirilecekKTop} bold hl />
@@ -3105,14 +3399,14 @@ export default function App() {
             <KDVRow label="(-) Indirilecek KDV" val={indirilecekTop} valK={indirilecekKTop} />
             <KDVRow label="Fark (Hesaplanan - Indirilecek)" val={fark} valK={hesaplananKTop != null && indirilecekKTop != null ? hesaplananKTop - indirilecekKTop : null} bold />
             {odenecek > 0 ? (
-              <div style={{ display: "flex", justifyContent: "space-between", padding: "14px", background: "#FCEBEB" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", padding: "14px", background: "var(--color-background-danger)" }}>
                 <span style={{ fontSize: 15, fontWeight: 700 }}>ODENECEK KDV</span>
-                <span style={{ fontSize: 22, fontWeight: 700, color: "#A32D2D", fontVariantNumeric: "tabular-nums" }}>{formatN(odenecek)}</span>
+                <span style={{ fontSize: 22, fontWeight: 700, color: "var(--color-text-danger)", fontVariantNumeric: "tabular-nums" }}>{formatN(odenecek)}</span>
               </div>
             ) : (
-              <div style={{ display: "flex", justifyContent: "space-between", padding: "14px", background: "#E1F5EE" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", padding: "14px", background: "var(--color-background-success)" }}>
                 <span style={{ fontSize: 15, fontWeight: 700 }}>SONRAKI DONEME DEVREDEN KDV</span>
-                <span style={{ fontSize: 22, fontWeight: 700, color: "#0F6E56", fontVariantNumeric: "tabular-nums" }}>{formatN(sonrakiDevreden)}</span>
+                <span style={{ fontSize: 22, fontWeight: 700, color: "var(--color-text-success)", fontVariantNumeric: "tabular-nums" }}>{formatN(sonrakiDevreden)}</span>
               </div>
             )}
           </div>

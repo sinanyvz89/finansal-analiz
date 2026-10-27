@@ -342,8 +342,11 @@ export function fragmentsToMizanRows(pages) {
     lastRow = row; lastLine = ln;
   }
   if (out.length < 4) return { rows: null, error: "NOTABLE" };
-  const info = { pages: pages.length, accounts: out.length - 1, columns: clusters.length, roles: col, clusters: clusters.map((c) => ({ r: Math.round(c.r), n: c.n })), labels };
-  return { rows: out.map((r) => r.slice(0, 6)), info };
+  // Tablonun ustundeki baslik blogu (sirket adi, Baslangic/Bitis tarihleri): donem tespiti icin basa eklenir
+  const headBlock = allLines.filter((l) => l.page === firstPage && l.y > firstY && !hdrLines.includes(l)).slice(0, 12).map((l) => l.items.map((f) => f.s));
+  out.unshift(...headBlock);
+  const info = { pages: pages.length, accounts: out.length - 1 - headBlock.length, columns: clusters.length, roles: col, clusters: clusters.map((c) => ({ r: Math.round(c.r), n: c.n })), labels };
+  return { rows: out.map((r) => Array.from(r)), info };
 }
 
 export async function pdfToMizanRows(data, pdfjsLib, onProgress) {
