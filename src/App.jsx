@@ -1,4 +1,4 @@
-import { useState, useCallback, useMemo, useRef } from "react";
+import { useState, useCallback, useMemo, useRef, useEffect, useLayoutEffect } from "react";
 import Papa from "papaparse";
 import * as XLSX from "xlsx";
 
@@ -17,9 +17,25 @@ function formatN(n) {
 function pct(a, b) { return b ? (a / b) * 100 : 0; }
 function degFn(y, e) { return (e == null || e === 0) ? null : ((y - e) / Math.abs(e)) * 100; }
 
-/* ── DOWNLOAD HELPER (tested & working) ── */
-function downloadCSV(content, filename) {
-  const blob = new Blob(["\uFEFF" + content], { type: "text/csv;charset=utf-8" });
+/* ── DOWNLOAD / SHARE HELPER ──
+   Mobilde (dokunmatik cihazlarda) dosya, telefonun paylasim menusuyle acilir:
+   WhatsApp, Mail, Dosyalar, Drive vb. Paylasim desteklenmezse klasik indirme yapilir. */
+function saveFile(blob, filename) {
+  try {
+    const coarse = typeof window !== "undefined" && window.matchMedia && window.matchMedia("(pointer: coarse)").matches;
+    if (coarse && navigator.canShare && typeof File !== "undefined") {
+      const file = new File([blob], filename, { type: blob.type });
+      if (navigator.canShare({ files: [file] })) {
+        navigator.share({ files: [file], title: filename }).catch((e) => {
+          if (e && e.name !== "AbortError") anchorDownload(blob, filename);
+        });
+        return;
+      }
+    }
+  } catch (e) { /* paylasim yoksa indirmeye dus */ }
+  anchorDownload(blob, filename);
+}
+function anchorDownload(blob, filename) {
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
@@ -27,20 +43,149 @@ function downloadCSV(content, filename) {
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
-  URL.revokeObjectURL(url);
+  setTimeout(() => URL.revokeObjectURL(url), 4000);
+}
+function downloadCSV(content, filename) {
+  saveFile(new Blob(["\uFEFF" + content], { type: "text/csv;charset=utf-8" }), filename);
+}
+function downloadHTML(content, filename) {
+  saveFile(new Blob([content], { type: "text/html;charset=utf-8" }), filename);
 }
 
-function downloadHTML(content, filename) {
-  const blob = new Blob([content], { type: "text/html;charset=utf-8" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
+/* ── Cihazda kalici saklama (IndexedDB) ──
+   Yuklenen mizanlar ve girilen bilgiler sadece bu cihazda tutulur, sunucuya gitmez. */
+const IDB_NAME = "finanaliz", IDB_STORE = "kv";
+function idbOpen() {
+  return new Promise((resolve, reject) => {
+    if (typeof indexedDB === "undefined") return reject(new Error("no idb"));
+    const req = indexedDB.open(IDB_NAME, 1);
+    req.onupgradeneeded = () => req.result.createObjectStore(IDB_STORE);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
 }
+async function idbGet(key) {
+  try { const db = await idbOpen(); return await new Promise((res) => { const r = db.transaction(IDB_STORE).objectStore(IDB_STORE).get(key); r.onsuccess = () => res(r.result); r.onerror = () => res(undefined); }); } catch (e) { return undefined; }
+}
+async function idbSet(key, val) {
+  try { const db = await idbOpen(); await new Promise((res) => { const tx = db.transaction(IDB_STORE, "readwrite"); tx.objectStore(IDB_STORE).put(val, key); tx.oncomplete = res; tx.onerror = res; }); } catch (e) { /* sessiz */ }
+}
+async function idbClear() {
+  try { const db = await idbOpen(); await new Promise((res) => { const tx = db.transaction(IDB_STORE, "readwrite"); tx.objectStore(IDB_STORE).clear(); tx.oncomplete = res; tx.onerror = res; }); } catch (e) { /* sessiz */ }
+}
+
+/* ── Mobil yerlesim yardimcilari ── */
+const MOBILE_BP = 760;
+function useIsMobile() {
+  const q = "(max-width: " + MOBILE_BP + "px)";
+  const get = () => typeof window !== "undefined" && window.matchMedia ? window.matchMedia(q).matches : false;
+  const [m, setM] = useState(get);
+  useEffect(() => {
+    if (!window.matchMedia) return;
+    const mq = window.matchMedia(q);
+    const on = () => setM(mq.matches);
+    mq.addEventListener ? mq.addEventListener("change", on) : mq.addListener(on);
+    return () => { mq.removeEventListener ? mq.removeEventListener("change", on) : mq.removeListener(on); };
+  }, []);
+  return m;
+}
+function parseTracks(tpl) {
+  const out = []; let depth = 0, cur = "";
+  for (const ch of String(tpl).trim()) {
+    if (ch === "(") depth++;
+    if (ch === ")") depth--;
+    if (ch === " " && depth === 0) { if (cur) out.push(cur); cur = ""; } else cur += ch;
+  }
+  if (cur) out.push(cur);
+  const res = [];
+  for (const t of out) { const m = t.match(/^repeat\((\d+),\s*(.+)\)$/); if (m) { for (let i = 0; i < +m[1]; i++) res.push(m[2]); } else res.push(t); }
+  return res;
+}
+function trackFr(t) { const m = String(t).match(/([\d.]+)fr\)?$/); return m ? parseFloat(m[1]) : null; }
+function effectiveBg(el) {
+  let n = el;
+  while (n && n.nodeType === 1) {
+    const c = getComputedStyle(n).backgroundColor;
+    if (c && c !== "transparent" && !/rgba\(\s*0,\s*0,\s*0,\s*0\s*\)/.test(c)) return c;
+    n = n.parentElement;
+  }
+  return "var(--color-background-primary)";
+}
+/* Masaustu icin yazilmis grid yapilarini telefona uyarlar:
+   - kart gridleri (repeat(4/3)) -> 2 sutun, yan yana paneller -> alt alta
+   - cok sutunlu tablo satirlari -> yatay kaydirilabilir, hesap adi sutunu sabit (sticky) */
+const FA_CLS = ["fa-cards1", "fa-cards2", "fa-wide", "fa-sticky", "fa-sticky2", "fa-xscroll"];
+function applyMobileLayout(root, mobile) {
+  if (!root) return;
+  // 1) Okuma asamasi (DOM'a yazmadan olcum yap -> tek yerlesim hesabi)
+  const plan = new Map();
+  const P = (el) => { let p = plan.get(el); if (!p) { p = { cls: new Set(), vars: {} }; plan.set(el, p); } return p; };
+  if (mobile) {
+    root.querySelectorAll('div[style*="grid-template-columns"]').forEach((el) => {
+      if (el.classList.contains("fa-keep") || el.classList.contains("fa-stack")) return;
+      const raw = el.style.gridTemplateColumns || "";
+      if (/auto-fit|auto-fill/.test(raw)) return;
+      const tracks = parseTracks(raw); const n = tracks.length;
+      if (n < 2) return;
+      const gap = parseFloat(el.style.columnGap || el.style.gap) || 0;
+      if (/^repeat\(/.test(raw.trim())) { P(el).cls.add(n >= 3 ? "fa-cards2" : "fa-cards1"); return; }
+      if (n === 2 && gap >= 12) { P(el).cls.add("fa-cards1"); return; }
+      const frs = tracks.map(trackFr);
+      if (gap >= 8 && frs.every((f) => f != null && f === frs[0])) { P(el).cls.add(n >= 3 ? "fa-cards2" : "fa-cards1"); return; }
+      if (n < 3) return;
+      // Tablo satiri: hesap adi sutunu sabit, rakamlar yatay kaydirilir
+      const known = frs.filter((x) => x != null);
+      const maxFr = known.length ? Math.max(...known) : 1;
+      const li = frs.findIndex((f) => f != null && f === maxFr);
+      const cs = getComputedStyle(el);
+      const padX = (parseFloat(cs.paddingLeft) || 0) + (parseFloat(cs.paddingRight) || 0) + gap * (n - 1);
+      const ws = frs.map((f, i) => (i === li ? 128 : f == null ? 44 : Math.max(52, Math.round(f * 96))));
+      const cols = frs.map((f, i) => (i === li ? "minmax(128px, 1.25fr)" : f == null ? "auto" : "minmax(" + ws[i] + "px, " + f + "fr)")).join(" ");
+      const minw = ws.reduce((s2, w) => s2 + w, 0) + padX;
+      const p = P(el);
+      p.cls.add("fa-wide");
+      p.vars["--fa-cols"] = cols;
+      p.vars["--fa-minw"] = Math.round(minw) + "px";
+      if (li === 0 || li === 1) { p.cls.add(li === 0 ? "fa-sticky" : "fa-sticky2"); p.vars["--fa-bg"] = effectiveBg(el); }
+      const parent = el.parentElement;
+      if (!parent || minw <= parent.clientWidth) return;
+      let a = parent, box = null, last = parent;
+      while (a && a !== root) {
+        if (getComputedStyle(a).overflowX !== "visible") { box = a; break; }
+        last = a; a = a.parentElement;
+      }
+      P(box || last).cls.add("fa-xscroll");
+    });
+  }
+  // 2) Yazma asamasi: sadece degisenleri guncelle
+  root.querySelectorAll("." + FA_CLS.join(",.")).forEach((el) => { if (!plan.has(el)) el.classList.remove(...FA_CLS); });
+  plan.forEach((p, el) => {
+    for (const c of FA_CLS) { const want = p.cls.has(c); if (el.classList.contains(c) !== want) el.classList.toggle(c, want); }
+    for (const k in p.vars) if (el.style.getPropertyValue(k) !== p.vars[k]) el.style.setProperty(k, p.vars[k]);
+  });
+}
+
+const FA_MOBILE_CSS = `
+.fa-app { -webkit-tap-highlight-color: transparent; }
+.fa-app button { touch-action: manipulation; }
+.fa-hscroll { overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none; }
+.fa-hscroll::-webkit-scrollbar { display: none; }
+@media (max-width: ${MOBILE_BP}px) {
+  .fa-app .fa-cards1, .fa-app .fa-stack { grid-template-columns: minmax(0, 1fr) !important; }
+  .fa-app .fa-cards2 { grid-template-columns: repeat(2, minmax(0, 1fr)) !important; gap: 10px !important; }
+  .fa-app .fa-cards1 > *, .fa-app .fa-cards2 > * { min-width: 0; }
+  .fa-app .fa-cards2 [style*="font-size: 2"] { font-size: 18px !important; overflow-wrap: anywhere; }
+  .fa-app .fa-cards2 [style*="padding: 18px 16px"], .fa-app .fa-cards2 [style*="padding: 16px 18px"] { padding: 12px !important; }
+  .fa-app .fa-wide { grid-template-columns: var(--fa-cols) !important; min-width: var(--fa-minw) !important; font-size: 12.5px !important; }
+  .fa-app .fa-sticky > :first-child, .fa-app .fa-sticky2 > :nth-child(2) { position: sticky; left: 0; z-index: 2; background: var(--fa-bg); white-space: normal !important; display: -webkit-box !important; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; line-height: 1.3; padding-right: 8px; }
+  .fa-app .fa-wide > span:not(:first-child) { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  .fa-app .fa-xscroll { overflow-x: auto !important; -webkit-overflow-scrolling: touch; overscroll-behavior-x: contain; }
+  .fa-app input, .fa-app select, .fa-app textarea { font-size: 16px !important; }
+  .fa-app .fa-content button { min-height: 36px; }
+  .fa-app .fa-content div[style*="justify-content: space-between"] { flex-wrap: wrap; row-gap: 8px; }
+  .fa-app .fa-content svg { max-width: 100%; height: auto; }
+}
+`;
 
 /* ── CSV Builder ── */
 function buildCSV(rows2d) {
@@ -427,22 +572,28 @@ const CARD = { background: "var(--color-background-secondary)", borderRadius: "v
 const DL_STYLE = { padding: "7px 14px", fontSize: 12, fontWeight: 500, cursor: "pointer", background: "var(--color-background-info)", color: "var(--color-text-info)", border: "0.5px solid var(--color-border-info)", borderRadius: "var(--border-radius-md)" };
 
 function Badge({ val }) { if (val == null || isNaN(val)) return null; return (<span style={{ fontSize: 11, padding: "2px 8px", borderRadius: 99, background: val >= 0 ? "#E1F5EE" : "#FCEBEB", color: val >= 0 ? "#0F6E56" : "#A32D2D", fontWeight: 500, whiteSpace: "nowrap" }}>{val >= 0 ? "+" : ""}{val.toFixed(1)}%</span>); }
-function CHeader({ d1, d2 }) {
-  if (!d2) return (<div style={{ display: "grid", gridTemplateColumns: "minmax(0,2.5fr) minmax(0,1fr)", padding: "8px 8px", background: "var(--color-background-secondary)", fontWeight: 500, fontSize: 13, color: "var(--color-text-secondary)", borderBottom: "0.5px solid var(--color-border-tertiary)" }}><span>Hesap</span><span style={{ textAlign: "right" }}>{d1}</span></div>);
-  return (<div style={{ display: "grid", gridTemplateColumns: "minmax(0,2.2fr) minmax(0,1fr) minmax(0,1fr) minmax(0,1fr) minmax(0,0.7fr)", padding: "8px 8px", background: "var(--color-background-secondary)", fontWeight: 500, fontSize: 12, color: "var(--color-text-secondary)", borderBottom: "0.5px solid var(--color-border-tertiary)" }}><span>Hesap</span><span style={{ textAlign: "right" }}>{d1}</span><span style={{ textAlign: "right" }}>{d2}</span><span style={{ textAlign: "right" }}>Fark</span><span style={{ textAlign: "right" }}>%</span></div>);
+function CHeader({ d1, d2, extras }) {
+  // extras = [{donem: "...", ...}] for multi-period
+  const allD = extras && extras.length > 0 ? [d1, ...extras.map((e) => e)] : (d2 ? [d1, d2] : [d1]);
+  const hasMulti = allD.length > 1;
+  const cols = hasMulti ? "minmax(0,1.8fr) " + allD.map(() => "minmax(0,1fr)").join(" ") : "minmax(0,2.5fr) minmax(0,1fr)";
+  return (<div style={{ display: "grid", gridTemplateColumns: cols, padding: "8px 8px", background: "var(--color-background-secondary)", fontWeight: 500, fontSize: allD.length > 4 ? 10 : 12, color: "var(--color-text-secondary)", borderBottom: "0.5px solid var(--color-border-tertiary)", minWidth: allD.length > 5 ? allD.length * 100 + 160 : "auto" }}><span>Hesap</span>{allD.map((dn, i) => <span key={i} style={{ textAlign: "right", fontWeight: i === 0 ? 600 : 400, color: i === 0 ? "var(--color-text-info)" : "var(--color-text-secondary)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{String(dn).substring(0, 12)}</span>)}</div>);
 }
-function CRow({ label, v1, v2, bold, sub, leaf, hl }) {
-  const hasK = v2 != null; const fark = hasK ? v1 - v2 : null; const dg = hasK ? degFn(v1, v2) : null;
+function CRow({ label, v1, v2, bold, sub, leaf, hl, extraVals }) {
+  // extraVals = [num, num, ...] for multi-period
+  const allV = extraVals && extraVals.length > 0 ? [v1, ...extraVals] : (v2 != null ? [v1, v2] : [v1]);
+  const hasMulti = allV.length > 1;
   const fs = leaf ? 12 : sub ? 13 : 14; const pl = leaf ? 40 : sub ? 28 : 8;
   const clr = leaf ? "var(--color-text-tertiary)" : sub ? "var(--color-text-secondary)" : "var(--color-text-primary)";
   const py = leaf ? "3px 0" : sub ? "5px 0" : "8px 0"; const bb = leaf ? "none" : "0.5px solid var(--color-border-tertiary)";
-  if (!hasK) return (<div style={{ display: "grid", gridTemplateColumns: "minmax(0,2.5fr) minmax(0,1fr)", padding: py, paddingLeft: pl, borderBottom: bb, fontWeight: bold ? 500 : 400, fontSize: fs, color: clr, background: hl ? "var(--color-background-secondary)" : "transparent", alignItems: "center" }}><span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{label}</span><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums", whiteSpace: "nowrap" }}>{formatN(v1)}</span></div>);
-  return (<div style={{ display: "grid", gridTemplateColumns: "minmax(0,2.2fr) minmax(0,1fr) minmax(0,1fr) minmax(0,1fr) minmax(0,0.7fr)", padding: py, paddingLeft: pl, borderBottom: bb, fontWeight: bold ? 500 : 400, fontSize: fs, color: clr, background: hl ? "var(--color-background-secondary)" : "transparent", alignItems: "center", gap: 2 }}><span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{label}</span><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums", whiteSpace: "nowrap" }}>{formatN(v1)}</span><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums", whiteSpace: "nowrap" }}>{formatN(v2)}</span><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums", whiteSpace: "nowrap", color: fark >= 0 ? "#0F6E56" : "#A32D2D" }}>{fark >= 0 ? "+" : ""}{formatN(fark)}</span><span style={{ textAlign: "right" }}><Badge val={dg} /></span></div>);
+  const cols = hasMulti ? "minmax(0,1.8fr) " + allV.map(() => "minmax(0,1fr)").join(" ") : "minmax(0,2.5fr) minmax(0,1fr)";
+  return (<div style={{ display: "grid", gridTemplateColumns: cols, padding: py, paddingLeft: pl, borderBottom: bb, fontWeight: bold ? 500 : 400, fontSize: fs, color: clr, background: hl ? "var(--color-background-secondary)" : "transparent", alignItems: "center", gap: 2, minWidth: allV.length > 5 ? allV.length * 100 + 160 : "auto" }}><span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{label}</span>{allV.map((v, i) => <span key={i} style={{ textAlign: "right", fontVariantNumeric: "tabular-nums", whiteSpace: "nowrap", fontWeight: i === 0 ? (bold ? 600 : 500) : 400, color: i === 0 ? clr : "var(--color-text-secondary)" }}>{formatN(v)}</span>)}</div>);
 }
-function SubCRows({ subs, type, top5Map, gK, subsKField }) {
+function SubCRows({ subs, type, top5Map, gK, subsKField, extraGelirler }) {
   if (!subs || !subs.length) return null;
   const subsK = gK && gK[subsKField] ? gK[subsKField] : [];
-  return (<>{subs.map((s) => { const val = type === "alacak" ? (s.aBak - s.bBak) : (s.bBak - s.aBak); if (val === 0) return null; const matchK = subsK.find((sk) => sk.kod === s.kod); const valK = matchK ? (type === "alacak" ? (matchK.aBak - matchK.bBak) : (matchK.bBak - matchK.aBak)) : null; const top5 = (top5Map && top5Map[s.kod]) ? top5Map[s.kod] : []; const top5K = (gK && gK.top5Map && gK.top5Map[s.kod]) ? gK.top5Map[s.kod] : []; return (<div key={s.kod}><CRow label={s.kod + " " + s.ad} v1={val} v2={valK} sub />{top5.map((t) => { const tK = top5K.find((tk) => tk.kod === t.kod); return <CRow key={t.kod} label={t.kod + " " + t.ad} v1={t.val} v2={tK ? tK.val : null} leaf />; })}</div>); })}</>);
+  const extraSubsList = (extraGelirler || []).map((eg) => eg && eg[subsKField] ? eg[subsKField] : []);
+  return (<>{subs.map((s) => { const val = type === "alacak" ? (s.aBak - s.bBak) : (s.bBak - s.aBak); if (val === 0) return null; const matchK = subsK.find((sk) => sk.kod === s.kod); const valK = matchK ? (type === "alacak" ? (matchK.aBak - matchK.bBak) : (matchK.bBak - matchK.aBak)) : null; const extraV = extraSubsList.map((esubs) => { const m = esubs.find((sk) => sk.kod === s.kod); return m ? (type === "alacak" ? (m.aBak - m.bBak) : (m.bBak - m.aBak)) : 0; }); const top5 = (top5Map && top5Map[s.kod]) ? top5Map[s.kod] : []; const top5K = (gK && gK.top5Map && gK.top5Map[s.kod]) ? gK.top5Map[s.kod] : []; return (<div key={s.kod}><CRow label={s.kod + " " + s.ad} v1={val} v2={extraV.length > 0 ? null : valK} sub extraVals={extraV.length > 0 ? extraV : undefined} />{top5.map((t) => { const tK = top5K.find((tk) => tk.kod === t.kod); return <CRow key={t.kod} label={t.kod + " " + t.ad} v1={t.val} v2={extraV.length > 0 ? null : (tK ? tK.val : null)} leaf />; })}</div>); })}</>);
 }
 function OranCard({ ad, deger, ac, renk }) { return (<div style={{ background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-lg)", padding: "1rem 1.25rem" }}><div style={{ fontSize: 12, color: "var(--color-text-secondary)", marginBottom: 6 }}>{ad}</div><div style={{ fontSize: 22, fontWeight: 500, color: renk }}>{deger}</div>{ac && <div style={{ fontSize: 12, color: "var(--color-text-tertiary)", marginTop: 4 }}>{ac}</div>}</div>); }
 
@@ -607,12 +758,26 @@ const SEKTORLER = {
 };
 
 const TABS = ["Mizan Yukle", "Gelir Tablosu", "Bilanco", "Nakit Akis", "Analizler", "Dashboard", "Rapor", "Vergi", "Sektor", "Gider Analizi", "Gelir Vergisi", "KDV"];
+const TAB_GROUPS = [
+  { grp: "Veri", tabs: [0] },
+  { grp: "Tablolar", tabs: [1, 2, 3] },
+  { grp: "Analiz", tabs: [4, 5, 6] },
+  { grp: "Vergi", tabs: [7, 10, 11] },
+  { grp: "Detay", tabs: [8, 9] },
+];
+const NAV_ICONS = {
+  Veri: '<path d="M12 15V4M7.5 8.5 12 4l4.5 4.5"/><path d="M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/>',
+  Tablolar: '<rect x="3.5" y="4" width="17" height="16" rx="2"/><path d="M3.5 9.5h17M3.5 14.5h17M9.5 9.5V20"/>',
+  Analiz: '<path d="M4 20h16"/><path d="M7 16v-4M12 16V6M17 16v-7"/>',
+  Vergi: '<path d="M6 3h12v18l-3-2-3 2-3-2-3 2z"/><path d="M9 8h6M9 12h6M9 16h3"/>',
+  Detay: '<circle cx="11" cy="11" r="6.5"/><path d="m20 20-4.2-4.2"/>',
+};
 
 export default function App() {
   const [tab, setTab] = useState(0);
   const [mizanlar, setMizanlar] = useState([]);
   const [sel, setSel] = useState(0);
-  const [karsi, setKarsi] = useState(-1);
+  const [karsiList, setKarsiList] = useState([]);
   const [loading, setLoading] = useState(false);
   const [info, setInfo] = useState(null);
   const [detay, setDetay] = useState(true);
@@ -641,13 +806,113 @@ export default function App() {
   const [gvVergiIndirimi, setGvVergiIndirimi] = useState("5");
   const fRef = useRef();
 
+  /* ── Mobil / PWA durumlari ── */
+  const isMobile = useIsMobile();
+  const contentRef = useRef(null);
+  const [periodOpen, setPeriodOpen] = useState(false);
+  const [lastInGroup, setLastInGroup] = useState({});
+  const [toast, setToast] = useState(null);
+  const [online, setOnline] = useState(() => typeof navigator === "undefined" ? true : navigator.onLine !== false);
+  const [restored, setRestored] = useState(false);
+  const [installEvt, setInstallEvt] = useState(() => (typeof window !== "undefined" && window.__faInstall) || null);
+  const [installHidden, setInstallHidden] = useState(() => { try { return localStorage.getItem("fa-install-hidden") === "1"; } catch (e) { return false; } });
+  const [clearArm, setClearArm] = useState(false);
+  const [layoutTick, setLayoutTick] = useState(0);
+  const isStandalone = typeof window !== "undefined" && ((window.matchMedia && window.matchMedia("(display-mode: standalone)").matches) || window.navigator.standalone === true);
+  const isIOS = typeof navigator !== "undefined" && (/iphone|ipad|ipod/i.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1));
+
+  const showToast = useCallback((t) => { setToast(t); clearTimeout(showToast._t); showToast._t = setTimeout(() => setToast(null), 2800); }, []);
+
+  // Cevrimici / cevrimdisi, kurulum istemi, ekran boyutu
+  useEffect(() => {
+    const on = () => setOnline(true), off = () => setOnline(false);
+    const inst = () => setInstallEvt(window.__faInstall || null);
+    const installed = () => { setInstallEvt(null); window.__faInstall = null; };
+    let rt; const rs = () => { clearTimeout(rt); rt = setTimeout(() => setLayoutTick((x) => x + 1), 150); };
+    window.addEventListener("online", on); window.addEventListener("offline", off);
+    window.addEventListener("fa-installable", inst); window.addEventListener("appinstalled", installed);
+    window.addEventListener("resize", rs);
+    return () => { window.removeEventListener("online", on); window.removeEventListener("offline", off); window.removeEventListener("fa-installable", inst); window.removeEventListener("appinstalled", installed); window.removeEventListener("resize", rs); };
+  }, []);
+
+  // Acilista: cihazda kayitli mizanlari ve ayarlari geri yukle
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      const saved = await idbGet("mizanlar");
+      const st = (await idbGet("ayarlar")) || {};
+      if (!alive) return;
+      if (Array.isArray(saved) && saved.length) {
+        setMizanlar((p) => (p.length ? p : saved));
+        const n = saved.length;
+        if (typeof st.sel === "number" && st.sel < n) setSel(st.sel);
+        if (Array.isArray(st.karsiList)) setKarsiList(st.karsiList.filter((x) => typeof x === "number" && x < n && x !== st.sel));
+        let urlTab = null;
+        try { const q = new URLSearchParams(window.location.search).get("tab"); if (q != null && !isNaN(+q)) urlTab = +q; } catch (e) {}
+        const t = urlTab != null ? urlTab : st.tab;
+        if (typeof t === "number" && t >= 0 && t < TABS.length) setTab(t);
+        showToast(n + " donem bu cihazdan geri yuklendi");
+      }
+      if (st.vergiSMM != null) setVergiSMM(st.vergiSMM);
+      if (st.vergiOran != null) setVergiOran(st.vergiOran);
+      if (st.vergiOdenen != null) setVergiOdenen(st.vergiOdenen);
+      if (st.sektor) setSektor(st.sektor);
+      if (Array.isArray(st.gvDilimler) && st.gvDilimler.length) setGvDilimler(st.gvDilimler);
+      if (Array.isArray(st.gvCeyrekler) && st.gvCeyrekler.length === 4) setGvCeyrekler(st.gvCeyrekler);
+      if (st.gvGeciciOran != null) setGvGeciciOran(st.gvGeciciOran);
+      if (st.gvBagkur != null) setGvBagkur(st.gvBagkur);
+      if (st.gvHataPayi != null) setGvHataPayi(st.gvHataPayi);
+      if (st.gvVergiIndirimi != null) setGvVergiIndirimi(st.gvVergiIndirimi);
+      setRestored(true);
+    })();
+    return () => { alive = false; };
+  }, []);
+
+  // Degisiklikleri cihaza kaydet
+  useEffect(() => { if (restored) idbSet("mizanlar", mizanlar); }, [restored, mizanlar]);
+  useEffect(() => {
+    if (!restored) return;
+    const t = setTimeout(() => idbSet("ayarlar", { sel, karsiList, tab, vergiSMM, vergiOran, vergiOdenen, sektor, gvDilimler, gvCeyrekler, gvGeciciOran, gvBagkur, gvHataPayi, gvVergiIndirimi }), 400);
+    return () => clearTimeout(t);
+  }, [restored, sel, karsiList, tab, vergiSMM, vergiOran, vergiOdenen, sektor, gvDilimler, gvCeyrekler, gvGeciciOran, gvBagkur, gvHataPayi, gvVergiIndirimi]);
+
+  // Sekme degisince basa kaydir, grubun son sekmesini hatirla
+  useEffect(() => {
+    try { window.scrollTo({ top: 0, behavior: "instant" }); } catch (e) { window.scrollTo(0, 0); }
+    setPeriodOpen(false);
+    const gr = TAB_GROUPS.find((x) => x.tabs.includes(tab));
+    if (gr) setLastInGroup((p) => (p[gr.grp] === tab ? p : { ...p, [gr.grp]: tab }));
+  }, [tab]);
+
+  // Her cizimden sonra tablolari telefona uyarla
+  useLayoutEffect(() => { applyMobileLayout(contentRef.current, isMobile); });
+
+  const doInstall = async () => {
+    const ev = installEvt || window.__faInstall;
+    if (!ev) return;
+    ev.prompt();
+    try { const r = await ev.userChoice; if (r && r.outcome === "accepted") showToast("Uygulama ana ekrana eklendi"); } catch (e) {}
+    window.__faInstall = null; setInstallEvt(null);
+  };
+  const hideInstall = () => { setInstallHidden(true); try { localStorage.setItem("fa-install-hidden", "1"); } catch (e) {} };
+  const clearAll = async () => {
+    if (!clearArm) { setClearArm(true); setTimeout(() => setClearArm(false), 4000); return; }
+    setClearArm(false);
+    await idbClear();
+    setMizanlar([]); setSel(0); setKarsiList([]); setInfo(null); setTab(0);
+    showToast("Bu cihazdaki tum veriler silindi");
+  };
+
+  const toggleKarsi = (idx) => setKarsiList((p) => p.includes(idx) ? p.filter((x) => x !== idx) : [...p, idx]);
+  const karsi = karsiList.length > 0 ? karsiList[0] : -1; // backward compat
+
   const onFile = useCallback(async (e) => {
     const files = Array.from(e.target.files || []); if (!files.length) return;
     setLoading(true); setInfo(null);
     for (const file of files) { try { const result = await readFile(file); if (result.error) { setInfo({ ok: false, text: result.error }); continue; } if (!result.rows) { setInfo({ ok: false, text: "Dosya okunamadi." }); continue; } const { data, err } = parseMizan(result.rows, file.name); if (data) { setMizanlar((p) => [...p, data]); setInfo({ ok: true, text: file.name + ": " + data.rows.length + " hesap yuklendi." }); } else { setInfo({ ok: false, text: err }); } } catch (ex) { setInfo({ ok: false, text: ex.message }); } }
     setLoading(false); if (fRef.current) fRef.current.value = "";
   }, []);
-  const remove = (i) => { setMizanlar((p) => p.filter((_, j) => j !== i)); setSel(0); setKarsi(-1); };
+  const remove = (i) => { setMizanlar((p) => p.filter((_, j) => j !== i)); setSel(0); setKarsiList([]); };
 
   const gelirler = useMemo(() => mizanlar.map(calcGelir), [mizanlar]);
   const bilancolar = useMemo(() => mizanlar.map((m, i) => calcBil(m, gelirler[i] ? gelirler[i].donemKari : 0)), [mizanlar, gelirler]);
@@ -660,30 +925,245 @@ export default function App() {
   const hasK = karsi >= 0 && gK != null;
   const d1 = mizanlar[sel] ? mizanlar[sel].donem : "";
   const d2 = hasK ? mizanlar[karsi].donem : null;
+
+  // Multi-period extras (excluding sel and first karsi)
+  const multiMode = karsiList.length > 1;
+  const extraDonems = karsiList.map((i) => mizanlar[i]?.donem || "?");
+  const extraGelirler = karsiList.map((i) => gelirler[i]);
+  const extraBilancolar = karsiList.map((i) => bilancolar[i]);
+  const multiGelirVal = (field) => extraGelirler.map((eg) => eg ? eg[field] : 0);
+  const multiBilVal = (field) => extraBilancolar.map((eb) => eb ? eb[field] : 0);
+
   const renk = (v, iyi, orta) => v >= iyi ? "#0F6E56" : v >= (orta != null ? orta : iyi) ? "#BA7517" : "#A32D2D";
 
-  return (
-    <div style={{ fontFamily: "var(--font-sans)", padding: "0.5rem 0" }}>
-      <div style={{ display: "flex", gap: 4, flexWrap: "wrap", marginBottom: "1.25rem", borderBottom: "0.5px solid var(--color-border-tertiary)", paddingBottom: 8 }}>
-        {TABS.map((t, i) => (<button key={i} onClick={() => setTab(i)} style={{ padding: "8px 14px", fontSize: 13, cursor: "pointer", fontWeight: tab === i ? 500 : 400, background: tab === i ? "var(--color-background-secondary)" : "transparent", border: tab === i ? "0.5px solid var(--color-border-secondary)" : "0.5px solid transparent", borderRadius: "var(--border-radius-md)", color: tab === i ? "var(--color-text-primary)" : "var(--color-text-secondary)" }}>{t}</button>))}
-      </div>
+  const activeGroup = TAB_GROUPS.find((gr) => gr.tabs.includes(tab)) || TAB_GROUPS[0];
+  const hasData = mizanlar.length > 0;
+  const showPeriods = mizanlar.length > 1 && tab > 0 && tab < 12;
+  const periodControls = (
+    <>
+          <div style={{ display: "flex", gap: 16, flexWrap: "wrap", alignItems: "center", marginBottom: karsiList.length > 0 ? 10 : 0 }}>
+            <label style={{ fontSize: 13, color: "var(--color-text-secondary)", display: "flex", alignItems: "center", gap: 6 }}>Ana donem: <select value={sel} onChange={(e) => { setSel(+e.target.value); setKarsiList((p) => p.filter((x) => x !== +e.target.value)); }} style={{ padding: "4px 8px", borderRadius: "var(--border-radius-md)", border: "0.5px solid var(--color-border-secondary)", fontSize: 13, fontWeight: 500 }}>{mizanlar.map((m, i) => <option key={i} value={i}>{m.donem}</option>)}</select></label>
+            <span style={{ fontSize: 12, color: "var(--color-text-tertiary)" }}>Karsilastir:</span>
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+              {mizanlar.map((m, i) => i !== sel ? (
+                <button key={i} onClick={() => toggleKarsi(i)} style={{ padding: "4px 12px", fontSize: 12, borderRadius: 99, cursor: "pointer", fontWeight: karsiList.includes(i) ? 600 : 400, background: karsiList.includes(i) ? "var(--color-background-info)" : "var(--color-background-primary)", color: karsiList.includes(i) ? "var(--color-text-info)" : "var(--color-text-secondary)", border: "0.5px solid " + (karsiList.includes(i) ? "var(--color-border-info)" : "var(--color-border-tertiary)"), transition: "all 0.15s" }}>{m.donem}</button>
+              ) : null)}
+              {karsiList.length > 0 && <button onClick={() => setKarsiList([])} style={{ padding: "4px 10px", fontSize: 11, borderRadius: 99, cursor: "pointer", background: "var(--color-background-danger)", color: "var(--color-text-danger)", border: "0.5px solid var(--color-border-danger)" }}>Temizle</button>}
+              {mizanlar.length > 2 && karsiList.length === 0 && <button onClick={() => setKarsiList(mizanlar.map((_, i) => i).filter((i) => i !== sel))} style={{ padding: "4px 10px", fontSize: 11, borderRadius: 99, cursor: "pointer", background: "var(--color-background-primary)", color: "var(--color-text-info)", border: "0.5px solid var(--color-border-info)" }}>Tumunu sec</button>}
+            </div>
+          </div>
+          {karsiList.length > 0 && <div style={{ fontSize: 11, color: "var(--color-text-tertiary)" }}>{karsiList.length} donem secildi — tablolarda karsilastirma aktif{karsiList.length > 1 ? " (coklu donem)" : ""}</div>}
+    </>
+  );
+  const barStyle = { background: "var(--fa-bar-bg)", backdropFilter: "saturate(1.6) blur(14px)", WebkitBackdropFilter: "saturate(1.6) blur(14px)" };
 
-      {mizanlar.length > 1 && tab > 0 && tab < 12 && (
-        <div style={{ display: "flex", gap: 16, flexWrap: "wrap", marginBottom: "1rem", fontSize: 13, color: "var(--color-text-secondary)" }}>
-          <label>Donem: <select value={sel} onChange={(e) => setSel(+e.target.value)}>{mizanlar.map((m, i) => <option key={i} value={i}>{m.donem}</option>)}</select></label>
-          <label>Karsilastir: <select value={karsi} onChange={(e) => setKarsi(+e.target.value)}><option value={-1}>--</option>{mizanlar.map((m, i) => i !== sel ? <option key={i} value={i}>{m.donem}</option> : null)}</select></label>
+  return (
+    <div className="fa-app" style={{ fontFamily: "var(--font-sans)", padding: isMobile ? 0 : "0.5rem 0", paddingBottom: isMobile ? "calc(86px + env(safe-area-inset-bottom))" : undefined }}>
+      <style>{FA_MOBILE_CSS}</style>
+
+      {/* ── Masaustu navigasyon ── */}
+      {!isMobile && (<>
+      <div style={{ marginBottom: "1.25rem" }}>
+        <div style={{ display: "flex", gap: 4, flexWrap: "wrap", paddingBottom: 8, borderBottom: "0.5px solid var(--color-border-tertiary)" }}>
+          {TAB_GROUPS.map((group) => (
+            <div key={group.grp} style={{ display: "flex", gap: 2, alignItems: "center" }}>
+              {group.tabs.map((i) => {
+                const disabled = i > 0 && !mizanlar.length;
+                return (<button key={i} data-tab={i} onClick={() => !disabled && setTab(i)} style={{ padding: "8px 12px", fontSize: 12, cursor: disabled ? "default" : "pointer", fontWeight: tab === i ? 600 : 400, background: tab === i ? "var(--color-background-info)" : "transparent", border: tab === i ? "0.5px solid var(--color-border-info)" : "0.5px solid transparent", borderRadius: "var(--border-radius-md)", color: tab === i ? "var(--color-text-info)" : disabled ? "var(--color-text-tertiary)" : "var(--color-text-secondary)", opacity: disabled ? 0.5 : 1, transition: "all 0.15s" }}>{TABS[i]}</button>);
+              })}
+              {group !== TAB_GROUPS[TAB_GROUPS.length - 1] && <span style={{ margin: "0 6px", color: "var(--color-border-tertiary)", fontSize: 11 }}>|</span>}
+            </div>
+          ))}
+        </div>
+      </div>
+      {showPeriods && (
+        <div style={{ marginBottom: "1rem", padding: "12px 14px", background: "var(--color-background-secondary)", borderRadius: "var(--border-radius-md)" }}>
+          {periodControls}
+        </div>
+      )}
+      </>)}
+
+      {/* ── Mobil ust cubuk: sekme adi, donem, alt sekmeler ── */}
+      {isMobile && (
+        <div style={{ position: "sticky", top: 0, zIndex: 50, margin: "0 -16px 14px", padding: "calc(env(safe-area-inset-top) + 10px) 16px 10px", borderBottom: "0.5px solid var(--color-border-tertiary)", ...barStyle }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
+              <span style={{ width: 30, height: 30, borderRadius: 9, background: "linear-gradient(135deg, #2F5496, #4A78C8)", color: "#fff", fontSize: 12, fontWeight: 700, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, letterSpacing: 0.3 }}>FA</span>
+              <div style={{ minWidth: 0 }}>
+                <div style={{ fontSize: 16, fontWeight: 650, lineHeight: 1.2, color: "var(--color-text-primary)" }}>{TABS[tab]}</div>
+                <div style={{ fontSize: 11, color: "var(--color-text-tertiary)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{hasData ? d1 + (karsiList.length ? " · +" + karsiList.length + " donem karsilastirma" : "") : "Finansal Analiz"}</div>
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: 6, alignItems: "center", flexShrink: 0 }}>
+              {!online && <span style={{ fontSize: 10, padding: "3px 8px", borderRadius: 99, background: "var(--color-background-warning)", color: "var(--color-text-warning)", fontWeight: 600 }}>Cevrimdisi</span>}
+              {showPeriods && <button onClick={() => setPeriodOpen((o) => !o)} aria-expanded={periodOpen} style={{ padding: "7px 12px", fontSize: 12, fontWeight: 600, borderRadius: 99, cursor: "pointer", background: periodOpen || karsiList.length ? "var(--color-background-info)" : "var(--color-background-secondary)", color: periodOpen || karsiList.length ? "var(--color-text-info)" : "var(--color-text-secondary)", border: "0.5px solid " + (periodOpen || karsiList.length ? "var(--color-border-info)" : "var(--color-border-tertiary)") }}>Donem {periodOpen ? "\u25B4" : "\u25BE"}</button>}
+            </div>
+          </div>
+          {activeGroup.tabs.length > 1 && (
+            <div className="fa-hscroll" style={{ display: "flex", gap: 6, marginTop: 10, marginRight: -16, paddingRight: 16 }}>
+              {activeGroup.tabs.map((i) => (
+                <button key={i} data-tab={i} onClick={() => setTab(i)} style={{ flexShrink: 0, padding: "8px 14px", fontSize: 13, borderRadius: 99, cursor: "pointer", whiteSpace: "nowrap", fontWeight: tab === i ? 600 : 500, background: tab === i ? "var(--color-text-info)" : "var(--color-background-secondary)", color: tab === i ? "var(--color-background-primary)" : "var(--color-text-secondary)", border: "none", transition: "all 0.15s" }}>{TABS[i]}</button>
+              ))}
+            </div>
+          )}
+          {showPeriods && periodOpen && (
+            <div style={{ marginTop: 10, padding: "12px", background: "var(--color-background-secondary)", borderRadius: 12, maxHeight: "55vh", overflowY: "auto" }}>
+              {periodControls}
+              <button onClick={() => setPeriodOpen(false)} style={{ marginTop: 10, width: "100%", padding: "10px", fontSize: 14, fontWeight: 600, borderRadius: 10, border: "none", cursor: "pointer", background: "var(--color-text-info)", color: "var(--color-background-primary)" }}>Tamam</button>
+            </div>
+          )}
         </div>
       )}
 
-      {/* TAB 0 */}
+      {toast && <div role="status" style={{ position: "fixed", left: "50%", transform: "translateX(-50%)", bottom: isMobile ? "calc(80px + env(safe-area-inset-bottom))" : 24, zIndex: 70, padding: "10px 16px", borderRadius: 99, background: "var(--color-text-primary)", color: "var(--color-background-primary)", fontSize: 13, fontWeight: 500, boxShadow: "0 6px 24px rgba(0,0,0,0.18)", maxWidth: "90vw", textAlign: "center" }}>{toast}</div>}
+
+      <div className="fa-content" ref={contentRef}>
+
+      {/* TAB 0: Mizan Yukle — Wizard */}
       {tab === 0 && (<div>
-        <div onClick={() => fRef.current && fRef.current.click()} style={{ border: "2px dashed var(--color-border-secondary)", borderRadius: "var(--border-radius-lg)", padding: "2.5rem 1.5rem", textAlign: "center", cursor: "pointer", background: "var(--color-background-secondary)" }}>
-          <div style={{ fontSize: 40, opacity: 0.25, lineHeight: 1, marginBottom: 8 }}>+</div>
-          <div style={{ fontSize: 15, fontWeight: 500, marginBottom: 4 }}>{loading ? "Yukleniyor..." : "Mizan dosyasini secin"}</div>
-          <div style={{ fontSize: 13, color: "var(--color-text-secondary)" }}>Excel (.xlsx .xls) / CSV (.csv) / ODS / XML / TXT</div></div>
-        <input ref={fRef} type="file" accept=".csv,.tsv,.txt,.xlsx,.xls,.ods,.xml" multiple onChange={onFile} style={{ display: "none" }} />
-        {info && (<div style={{ marginTop: 12, padding: "12px 16px", borderRadius: "var(--border-radius-md)", background: info.ok ? "var(--color-background-success)" : "var(--color-background-danger)" }}><div style={{ fontSize: 13, fontWeight: 500, color: info.ok ? "var(--color-text-success)" : "var(--color-text-danger)" }}>{info.text}</div></div>)}
-        {mizanlar.length > 0 && (<div style={{ marginTop: "1.5rem" }}><div style={SEC}>Yuklenen mizanlar ({mizanlar.length})</div>{mizanlar.map((m, i) => (<div key={i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 14px", border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-md)", marginBottom: 8 }}><div><div style={{ fontSize: 14, fontWeight: 500 }}>{m.donem}</div><div style={{ fontSize: 12, color: "var(--color-text-secondary)" }}>{m.rows.length} hesap</div></div><button onClick={() => remove(i)} style={{ fontSize: 12, color: "var(--color-text-danger)", background: "transparent", border: "none", cursor: "pointer" }}>Kaldir</button></div>))}</div>)}
+        {/* Uygulamayi ana ekrana ekle (PWA) */}
+        {!isStandalone && !installHidden && (installEvt || isIOS) && (
+          <div style={{ marginBottom: "1rem", padding: "14px 16px", borderRadius: 14, border: "0.5px solid var(--color-border-info)", background: "var(--color-background-primary)", display: "flex", gap: 12, alignItems: "flex-start" }}>
+            <span style={{ width: 40, height: 40, borderRadius: 11, background: "linear-gradient(135deg, #2F5496, #4A78C8)", color: "#fff", fontSize: 14, fontWeight: 700, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>FA</span>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 2 }}>Uygulama olarak kullanin</div>
+              {installEvt ? (
+                <div style={{ fontSize: 12, color: "var(--color-text-secondary)", lineHeight: 1.6 }}>Ana ekrana ekleyin; tam ekran acilir, internet olmadan da calisir. Magaza veya hesap gerekmez.</div>
+              ) : (
+                <div style={{ fontSize: 12, color: "var(--color-text-secondary)", lineHeight: 1.6 }}>Safari'de alttaki <b>Paylas</b> simgesine (kare ve yukari ok) dokunun, ardindan <b>Ana Ekrana Ekle</b>'yi secin. Tam ekran acilir, internet olmadan da calisir.</div>
+              )}
+              <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+                {installEvt && <button onClick={doInstall} style={{ padding: "8px 16px", fontSize: 13, fontWeight: 600, borderRadius: 99, border: "none", cursor: "pointer", background: "var(--color-text-info)", color: "var(--color-background-primary)" }}>Ana ekrana ekle</button>}
+                <button onClick={hideInstall} style={{ padding: "8px 14px", fontSize: 13, borderRadius: 99, border: "0.5px solid var(--color-border-tertiary)", cursor: "pointer", background: "transparent", color: "var(--color-text-secondary)" }}>Simdi degil</button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Step 1: Bilgilendirme */}
+        {mizanlar.length === 0 && (
+          <div style={{ marginBottom: "1.5rem", padding: "20px", background: "linear-gradient(135deg, var(--color-background-info) 0%, var(--color-background-primary) 100%)", borderRadius: 16, border: "0.5px solid var(--color-border-info)" }}>
+            <div style={{ fontSize: 17, fontWeight: 600, color: "var(--color-text-info)", marginBottom: 8 }}>Hosgeldiniz</div>
+            <div style={{ fontSize: 13, color: "var(--color-text-secondary)", lineHeight: 1.8 }}>
+              Bu uygulama muhasebe programinizdan aldığınız <b>mizan</b> dosyasini yukleyerek otomatik finansal analiz yapar.
+              Gelir tablosu, bilanco, nakit akis, finansal oranlar, dashboard, gider analizi, vergi ve KDV tablolari otomatik olusturulur.
+            </div>
+            <div className="fa-stack" style={{ marginTop: 14, display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 10 }}>
+              {[
+                ["1", "Mizan yukle", "Asagidaki alana dosyanizi surukleyin veya tiklayin"],
+                ["2", "Donemi dogrulayin", "Sistem dosya adindan donemi algilayacak"],
+                ["3", "Analiz baslat", "Tum tablolar otomatik olusturulur"],
+              ].map(([n, title, desc]) => (
+                <div key={n} style={{ display: "flex", gap: 10, alignItems: "flex-start" }}>
+                  <span style={{ width: 24, height: 24, borderRadius: "50%", background: "var(--color-text-info)", color: "#fff", fontSize: 12, fontWeight: 600, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>{n}</span>
+                  <div><div style={{ fontSize: 13, fontWeight: 500 }}>{title}</div><div style={{ fontSize: 11, color: "var(--color-text-tertiary)" }}>{desc}</div></div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Upload Area */}
+        <div style={{ marginBottom: "1rem" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+            <span style={{ fontSize: 15, fontWeight: 500 }}>{mizanlar.length === 0 ? "Adim 1: Mizan dosyasini yukleyin" : "Baska bir donem daha ekleyin"}</span>
+            {mizanlar.length > 0 && <span style={{ fontSize: 11, padding: "2px 10px", borderRadius: 99, background: "var(--color-background-success)", color: "var(--color-text-success)", fontWeight: 500 }}>{mizanlar.length} donem yuklendi</span>}
+          </div>
+          <div onClick={() => fRef.current && fRef.current.click()} style={{ border: "2px dashed var(--color-border-secondary)", borderRadius: 16, padding: "2.5rem 1.5rem", textAlign: "center", cursor: "pointer", background: "var(--color-background-secondary)", transition: "border-color 0.2s" }}>
+            <div style={{ fontSize: 40, opacity: 0.2, lineHeight: 1, marginBottom: 8 }}>+</div>
+            <div style={{ fontSize: 15, fontWeight: 500, marginBottom: 4 }}>{loading ? "Yukleniyor..." : "Dosya secmek icin tiklayin"}</div>
+            <div style={{ fontSize: 13, color: "var(--color-text-secondary)", marginBottom: 8 }}>Excel (.xlsx .xls) / CSV (.csv) / ODS / XML / TXT</div>
+            <div style={{ fontSize: 11, color: "var(--color-text-tertiary)" }}>Birden fazla dosya secebilirsiniz — her biri ayri donem olarak yuklenir</div>
+          </div>
+          <input ref={fRef} type="file" accept=".csv,.tsv,.txt,.xlsx,.xls,.ods,.xml" multiple onChange={onFile} style={{ display: "none" }} />
+        </div>
+
+        {/* Info Note */}
+        <div style={{ padding: "12px 14px", background: "var(--color-background-warning)", borderRadius: "var(--border-radius-md)", borderLeft: "3px solid var(--color-border-warning)", marginBottom: "1rem", fontSize: 12, color: "var(--color-text-warning)", lineHeight: 1.7 }}>
+          <b>Mizan dosyasi nasil olmali?</b> Muhasebe programinizdan (Logo, Mikro, Eta, Luca, Parasut, Netsis, Zirve vb.) mizan raporunu alistiginiz sekilde disari aktarin.
+          Sistemimiz baslik satirini otomatik algilar — "Hesap Kodu", "Borc Bakiye", "Alacak Bakiye" sutunlarini bulur.
+          Dosya adini donem bilgisi iceren sekilde verin (orn: "Ocak_2025_Mizan.xlsx") — sistem donemi buradan algilar.
+        </div>
+
+        {/* Upload Result */}
+        {info && (<div style={{ marginBottom: "1rem", padding: "12px 16px", borderRadius: "var(--border-radius-md)", background: info.ok ? "var(--color-background-success)" : "var(--color-background-danger)", borderLeft: "3px solid " + (info.ok ? "var(--color-border-success)" : "var(--color-border-danger)") }}>
+          <div style={{ fontSize: 13, fontWeight: 500, color: info.ok ? "var(--color-text-success)" : "var(--color-text-danger)" }}>{info.ok ? "Basariyla yuklendi" : "Yukleme hatasi"}</div>
+          <div style={{ fontSize: 12, color: info.ok ? "var(--color-text-success)" : "var(--color-text-danger)", opacity: 0.8, marginTop: 2 }}>{info.text}</div>
+        </div>)}
+
+        {/* Loaded Mizans */}
+        {mizanlar.length > 0 && (<div style={{ marginBottom: "1.5rem" }}>
+          <div style={{ fontSize: 15, fontWeight: 500, marginBottom: 10 }}>Yuklenen donemler ({mizanlar.length})</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {mizanlar.map((m, i) => {
+              const gl = gelirler[i];
+              const bl = bilancolar[i];
+              return (
+                <div key={i} style={{ padding: "14px 16px", border: "0.5px solid var(--color-border-tertiary)", borderRadius: 14, background: "var(--color-background-primary)" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                      <span style={{ width: 32, height: 32, borderRadius: 8, background: "var(--color-background-info)", color: "var(--color-text-info)", fontSize: 14, fontWeight: 600, display: "flex", alignItems: "center", justifyContent: "center" }}>{i + 1}</span>
+                      <div><div style={{ fontSize: 15, fontWeight: 600 }}>{m.donem}</div><div style={{ fontSize: 12, color: "var(--color-text-tertiary)" }}>{m.rows.length} hesap satirı algilandi</div></div>
+                    </div>
+                    <button onClick={() => remove(i)} style={{ fontSize: 12, color: "var(--color-text-danger)", background: "var(--color-background-danger)", border: "none", cursor: "pointer", padding: "4px 12px", borderRadius: "var(--border-radius-md)", fontWeight: 500 }}>Kaldir</button>
+                  </div>
+                  {gl && bl && (
+                    <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 8 }}>
+                      {[
+                        ["Net Satis", gl.netSatis, "#85B7EB"],
+                        ["Donem Kari", gl.donemKari, gl.donemKari >= 0 ? "#5DCAA5" : "#F09595"],
+                        ["Aktif Top.", bl.aktif, "#AFA9EC"],
+                        ["Ozkaynak", bl.ozk, "#9FE1CB"],
+                      ].map(([l, v, c]) => (
+                        <div key={l} style={{ padding: "8px 10px", borderRadius: 8, background: "var(--color-background-secondary)", position: "relative", overflow: "hidden" }}>
+                          <div style={{ position: "absolute", top: 0, left: 0, width: "100%", height: 2, background: c }} />
+                          <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginBottom: 2 }}>{l}</div>
+                          <div style={{ fontSize: 13, fontWeight: 600, fontVariantNumeric: "tabular-nums" }}>{formatN(v)}</div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>)}
+
+        {/* Cihazda saklama bilgisi */}
+        {mizanlar.length > 0 && (
+          <div style={{ marginBottom: "1.5rem", padding: "12px 14px", borderRadius: "var(--border-radius-md)", background: "var(--color-background-secondary)", display: "flex", gap: 12, alignItems: "center", justifyContent: "space-between", flexWrap: "wrap" }}>
+            <div style={{ fontSize: 12, color: "var(--color-text-secondary)", lineHeight: 1.6, flex: "1 1 220px" }}>
+              <b style={{ color: "var(--color-text-primary)" }}>Verileriniz bu cihazda saklanir.</b> Uygulamayi kapatip actiginizda kaldiginiz yerden devam edersiniz. Hicbir veri sunucuya gonderilmez.
+            </div>
+            <button onClick={clearAll} style={{ padding: "8px 14px", fontSize: 12, fontWeight: 600, borderRadius: 99, cursor: "pointer", border: "0.5px solid var(--color-border-danger)", background: clearArm ? "var(--color-text-danger)" : "var(--color-background-danger)", color: clearArm ? "#fff" : "var(--color-text-danger)", whiteSpace: "nowrap" }}>{clearArm ? "Emin misiniz? Tekrar dokunun" : "Tum verileri sil"}</button>
+          </div>
+        )}
+
+        {/* Quick Start Cards */}
+        {mizanlar.length > 0 && (
+          <div>
+            <div style={{ fontSize: 15, fontWeight: 500, marginBottom: 10 }}>Hizli erisim</div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 10 }}>
+              {[
+                [1, "Gelir Tablosu", "Satis, maliyet, kar/zarar", "#85B7EB"],
+                [2, "Bilanco", "Aktif-pasif yapisi", "#AFA9EC"],
+                [5, "Dashboard", "Gorunumu", "#5DCAA5"],
+                [7, "Vergi", "Vergi hesaplama", "#FAC775"],
+              ].map(([ti, l, d2x, c]) => (
+                <div key={ti} onClick={() => setTab(ti)} style={{ padding: "14px", borderRadius: 12, background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-tertiary)", cursor: "pointer", position: "relative", overflow: "hidden", transition: "transform 0.1s" }}>
+                  <div style={{ position: "absolute", top: 0, left: 0, width: "100%", height: 3, background: c }} />
+                  <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 2 }}>{l}</div>
+                  <div style={{ fontSize: 11, color: "var(--color-text-tertiary)" }}>{d2x}</div>
+                </div>
+              ))}
+            </div>
+            {mizanlar.length === 1 && (
+              <div style={{ marginTop: 12, padding: "10px 14px", background: "var(--color-background-info)", borderRadius: "var(--border-radius-md)", borderLeft: "3px solid var(--color-border-info)", fontSize: 12, color: "var(--color-text-info)", lineHeight: 1.7 }}>
+                <b>Ipucu:</b> Karsilastirmali analiz icin ikinci bir donem daha yukleyin. Boylece tum tablolarda onceki donem ile fark ve degisim yuzdeleri goruntulenecektir.
+              </div>
+            )}
+          </div>
+        )}
       </div>)}
 
       {/* TAB 1 */}
@@ -695,31 +1175,31 @@ export default function App() {
             <button onClick={() => exportGelirCSV(g, gK, d1, d2)} style={DL_STYLE}>CSV Indir</button>
             <button onClick={() => exportGelirHTML(g, gK, d1, d2)} style={{ ...DL_STYLE, background: "var(--color-background-success)", color: "var(--color-text-success)", border: "0.5px solid var(--color-border-success)" }}>PDF (HTML) Indir</button>
           </div></div>
-        <div style={{ border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-lg)", overflow: "hidden" }}>
-          <CHeader d1={d1} d2={d2} />
-          <CRow label="A. Brut satislar" v1={g.brutSatis} v2={gK ? gK.brutSatis : null} bold />
-          {detay && <SubCRows subs={g.subs60} type="alacak" top5Map={g.top5Map} gK={gK} subsKField="subs60" />}
-          <CRow label="B. Satis indirimleri (-)" v1={g.satisInd} v2={gK ? gK.satisInd : null} />
-          {detay && <SubCRows subs={g.subs61} type="borc" top5Map={g.top5Map} gK={gK} subsKField="subs61" />}
-          <CRow label="C. Net satislar" v1={g.netSatis} v2={gK ? gK.netSatis : null} bold hl />
-          <CRow label="D. Satislarin maliyeti (-)" v1={g.satisMal} v2={gK ? gK.satisMal : null} />
-          {detay && <SubCRows subs={g.subsMal} type="borc" top5Map={g.top5Map} gK={gK} subsKField="subsMal" />}
-          <CRow label="BRUT KAR" v1={g.brutKar} v2={gK ? gK.brutKar : null} bold hl />
-          <CRow label="E. Faaliyet giderleri (-)" v1={g.faalGid} v2={gK ? gK.faalGid : null} />
-          {detay && <SubCRows subs={g.subsFaal} type="borc" top5Map={g.top5Map} gK={gK} subsKField="subsFaal" />}
-          <CRow label="FAALIYET KARI" v1={g.faalKar} v2={gK ? gK.faalKar : null} bold hl />
-          <CRow label="F. Diger faal. gelirleri" v1={g.digerGel} v2={gK ? gK.digerGel : null} />
-          {detay && <SubCRows subs={g.subs64} type="alacak" top5Map={g.top5Map} gK={gK} subsKField="subs64" />}
-          <CRow label="G. Diger faal. giderleri (-)" v1={g.digerGid} v2={gK ? gK.digerGid : null} />
-          {detay && <SubCRows subs={g.subs65} type="borc" top5Map={g.top5Map} gK={gK} subsKField="subs65" />}
-          <CRow label="H. Finansman giderleri (-)" v1={g.finGid} v2={gK ? gK.finGid : null} />
-          {detay && <SubCRows subs={g.subsFin} type="borc" top5Map={g.top5Map} gK={gK} subsKField="subsFin" />}
-          <CRow label="OLAGAN KAR" v1={g.olaganKar} v2={gK ? gK.olaganKar : null} bold />
-          <CRow label="I. Olagandisi gelirler" v1={g.odGel} v2={gK ? gK.odGel : null} />
-          {detay && <SubCRows subs={g.subs67} type="alacak" top5Map={g.top5Map} gK={gK} subsKField="subs67" />}
-          <CRow label="J. Olagandisi giderler (-)" v1={g.odGid} v2={gK ? gK.odGid : null} />
-          {detay && <SubCRows subs={g.subs68} type="borc" top5Map={g.top5Map} gK={gK} subsKField="subs68" />}
-          <CRow label="DONEM NET KARI (ZARARI)" v1={g.donemKari} v2={gK ? gK.donemKari : null} bold hl />
+        <div style={{ border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-lg)", overflow: "hidden", overflowX: karsiList.length > 3 ? "auto" : "visible" }}>
+          <CHeader d1={d1} d2={!multiMode ? d2 : null} extras={multiMode ? extraDonems : undefined} />
+          <CRow label="A. Brut satislar" v1={g.brutSatis} v2={!multiMode && gK ? gK.brutSatis : null} bold extraVals={multiMode ? multiGelirVal("brutSatis") : undefined} />
+          {detay && <SubCRows subs={g.subs60} type="alacak" top5Map={g.top5Map} gK={!multiMode ? gK : null} subsKField="subs60" extraGelirler={multiMode ? extraGelirler : undefined} />}
+          <CRow label="B. Satis indirimleri (-)" v1={g.satisInd} v2={!multiMode && gK ? gK.satisInd : null} extraVals={multiMode ? multiGelirVal("satisInd") : undefined} />
+          {detay && <SubCRows subs={g.subs61} type="borc" top5Map={g.top5Map} gK={!multiMode ? gK : null} subsKField="subs61" extraGelirler={multiMode ? extraGelirler : undefined} />}
+          <CRow label="C. Net satislar" v1={g.netSatis} v2={!multiMode && gK ? gK.netSatis : null} bold hl extraVals={multiMode ? multiGelirVal("netSatis") : undefined} />
+          <CRow label="D. Satislarin maliyeti (-)" v1={g.satisMal} v2={!multiMode && gK ? gK.satisMal : null} extraVals={multiMode ? multiGelirVal("satisMal") : undefined} />
+          {detay && <SubCRows subs={g.subsMal} type="borc" top5Map={g.top5Map} gK={!multiMode ? gK : null} subsKField="subsMal" extraGelirler={multiMode ? extraGelirler : undefined} />}
+          <CRow label="BRUT KAR" v1={g.brutKar} v2={!multiMode && gK ? gK.brutKar : null} bold hl extraVals={multiMode ? multiGelirVal("brutKar") : undefined} />
+          <CRow label="E. Faaliyet giderleri (-)" v1={g.faalGid} v2={!multiMode && gK ? gK.faalGid : null} extraVals={multiMode ? multiGelirVal("faalGid") : undefined} />
+          {detay && <SubCRows subs={g.subsFaal} type="borc" top5Map={g.top5Map} gK={!multiMode ? gK : null} subsKField="subsFaal" extraGelirler={multiMode ? extraGelirler : undefined} />}
+          <CRow label="FAALIYET KARI" v1={g.faalKar} v2={!multiMode && gK ? gK.faalKar : null} bold hl extraVals={multiMode ? multiGelirVal("faalKar") : undefined} />
+          <CRow label="F. Diger faal. gelirleri" v1={g.digerGel} v2={!multiMode && gK ? gK.digerGel : null} extraVals={multiMode ? multiGelirVal("digerGel") : undefined} />
+          {detay && <SubCRows subs={g.subs64} type="alacak" top5Map={g.top5Map} gK={!multiMode ? gK : null} subsKField="subs64" extraGelirler={multiMode ? extraGelirler : undefined} />}
+          <CRow label="G. Diger faal. giderleri (-)" v1={g.digerGid} v2={!multiMode && gK ? gK.digerGid : null} extraVals={multiMode ? multiGelirVal("digerGid") : undefined} />
+          {detay && <SubCRows subs={g.subs65} type="borc" top5Map={g.top5Map} gK={!multiMode ? gK : null} subsKField="subs65" extraGelirler={multiMode ? extraGelirler : undefined} />}
+          <CRow label="H. Finansman giderleri (-)" v1={g.finGid} v2={!multiMode && gK ? gK.finGid : null} extraVals={multiMode ? multiGelirVal("finGid") : undefined} />
+          {detay && <SubCRows subs={g.subsFin} type="borc" top5Map={g.top5Map} gK={!multiMode ? gK : null} subsKField="subsFin" extraGelirler={multiMode ? extraGelirler : undefined} />}
+          <CRow label="OLAGAN KAR" v1={g.olaganKar} v2={!multiMode && gK ? gK.olaganKar : null} bold extraVals={multiMode ? multiGelirVal("olaganKar") : undefined} />
+          <CRow label="I. Olagandisi gelirler" v1={g.odGel} v2={!multiMode && gK ? gK.odGel : null} extraVals={multiMode ? multiGelirVal("odGel") : undefined} />
+          {detay && <SubCRows subs={g.subs67} type="alacak" top5Map={g.top5Map} gK={!multiMode ? gK : null} subsKField="subs67" extraGelirler={multiMode ? extraGelirler : undefined} />}
+          <CRow label="J. Olagandisi giderler (-)" v1={g.odGid} v2={!multiMode && gK ? gK.odGid : null} extraVals={multiMode ? multiGelirVal("odGid") : undefined} />
+          {detay && <SubCRows subs={g.subs68} type="borc" top5Map={g.top5Map} gK={!multiMode ? gK : null} subsKField="subs68" extraGelirler={multiMode ? extraGelirler : undefined} />}
+          <CRow label="DONEM NET KARI (ZARARI)" v1={g.donemKari} v2={!multiMode && gK ? gK.donemKari : null} bold hl extraVals={multiMode ? multiGelirVal("donemKari") : undefined} />
         </div>
       </div>)}
 
@@ -1516,14 +1996,37 @@ export default function App() {
             {notlar.map((n, i) => (<div key={i} style={{ display: "flex", gap: 10, alignItems: "flex-start", padding: "12px 16px", background: skorBg(n.tip), borderRadius: 10, borderLeft: "3px solid " + skorRenk(n.tip) }}><span style={{ fontWeight: 600, flexShrink: 0, color: skorRenk(n.tip) }}>{n.tip === "iyi" ? "+" : n.tip === "orta" ? "~" : "!"}</span><span style={{ fontSize: 13, lineHeight: 1.6 }}>{n.mesaj}</span></div>))}
           </div>
 
-          {/* Donemler Arasi */}
-          {hasK && (<div>
-            <div style={{ fontSize: 15, fontWeight: 500, marginBottom: 10 }}>Donemler arasi degisim</div>
-            <div style={{ border: "0.5px solid var(--color-border-tertiary)", borderRadius: 14, overflow: "hidden" }}>
-              <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr 1fr 1fr", padding: "10px 14px", background: "var(--color-background-secondary)", fontWeight: 500, fontSize: 12, color: "var(--color-text-secondary)" }}><span>Gosterge</span><span style={{ textAlign: "right" }}>{d1}</span><span style={{ textAlign: "right" }}>{d2}</span><span style={{ textAlign: "right" }}>Degisim</span></div>
-              {metrikler.map(([l, v1, v2]) => { if (v2 == null) return null; return (<div key={l} style={{ display: "grid", gridTemplateColumns: "2fr 1fr 1fr 1fr", padding: "10px 14px", borderBottom: "0.5px solid var(--color-border-tertiary)", fontSize: 13 }}><span style={{ fontWeight: 500 }}>{l}</span><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatN(v1)}</span><span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums", color: "var(--color-text-secondary)" }}>{formatN(v2)}</span><span style={{ textAlign: "right" }}><Badge val={degFn(v1, v2)} /></span></div>); })}
-            </div>
-          </div>)}
+          {/* Donemler Arasi — Coklu donem destekli */}
+          {karsiList.length > 0 && (() => {
+            const allIdx = [sel, ...karsiList];
+            const allDonem = allIdx.map((i) => mizanlar[i]?.donem || "?");
+            const allG = allIdx.map((i) => gelirler[i]);
+            const allB = allIdx.map((i) => bilancolar[i]);
+            const rows = [
+              ["Net Satis", allG.map((gx) => gx?.netSatis || 0)],
+              ["Donem Kari", allG.map((gx) => gx?.donemKari || 0)],
+              ["Brut Kar", allG.map((gx) => gx?.brutKar || 0)],
+              ["Aktif Toplam", allB.map((bx) => bx?.aktif || 0)],
+              ["Ozkaynaklar", allB.map((bx) => bx?.ozk || 0)],
+              ["Toplam Borc", allB.map((bx) => (bx?.kvyk || 0) + (bx?.uvyk || 0))],
+            ];
+            const colW = allDonem.length <= 4 ? "1fr" : "minmax(80px,1fr)";
+            return (<div>
+              <div style={{ fontSize: 15, fontWeight: 500, marginBottom: 10 }}>Donemler arasi karsilastirma ({allDonem.length} donem)</div>
+              <div style={{ border: "0.5px solid var(--color-border-tertiary)", borderRadius: 14, overflow: "hidden", overflowX: "auto" }}>
+                <div style={{ display: "grid", gridTemplateColumns: "1.5fr " + allDonem.map(() => colW).join(" "), padding: "10px 14px", background: "var(--color-background-secondary)", fontWeight: 500, fontSize: 11, color: "var(--color-text-secondary)", minWidth: allDonem.length > 5 ? allDonem.length * 110 + 150 : "auto" }}>
+                  <span>Gosterge</span>
+                  {allDonem.map((dn, di) => <span key={di} style={{ textAlign: "right", fontWeight: di === 0 ? 600 : 400, color: di === 0 ? "var(--color-text-info)" : "var(--color-text-secondary)" }}>{dn.substring(0, 12)}</span>)}
+                </div>
+                {rows.map(([label, vals]) => (
+                  <div key={label} style={{ display: "grid", gridTemplateColumns: "1.5fr " + allDonem.map(() => colW).join(" "), padding: "8px 14px", borderBottom: "0.5px solid var(--color-border-tertiary)", fontSize: 13, minWidth: allDonem.length > 5 ? allDonem.length * 110 + 150 : "auto" }}>
+                    <span style={{ fontWeight: 500, whiteSpace: "nowrap" }}>{label}</span>
+                    {vals.map((v, vi) => <span key={vi} style={{ textAlign: "right", fontVariantNumeric: "tabular-nums", fontWeight: vi === 0 ? 600 : 400, color: vi === 0 ? "var(--color-text-primary)" : "var(--color-text-secondary)" }}>{formatN(v)}</span>)}
+                  </div>
+                ))}
+              </div>
+            </div>);
+          })()}
         </div>);
       })()}
 
@@ -2601,7 +3104,31 @@ export default function App() {
         </div>);
       })()}
 
-      {tab > 0 && !mizanlar.length && (<div style={{ textAlign: "center", padding: "3rem 1rem", color: "var(--color-text-secondary)" }}><div style={{ fontSize: 32, opacity: 0.25, marginBottom: 8 }}>?</div><div style={{ fontSize: 14 }}>Henuz mizan yuklenmedi.</div></div>)}
+      {tab > 0 && !mizanlar.length && (<div style={{ textAlign: "center", padding: "3rem 1rem" }}>
+        <div style={{ fontSize: 48, opacity: 0.15, marginBottom: 12 }}>+</div>
+        <div style={{ fontSize: 16, fontWeight: 500, color: "var(--color-text-primary)", marginBottom: 6 }}>Henuz mizan yuklenmedi</div>
+        <div style={{ fontSize: 13, color: "var(--color-text-secondary)", marginBottom: 16, lineHeight: 1.6 }}>Bu sekmeyi kullanabilmek icin once bir mizan dosyasi yuklemeniz gerekir.</div>
+        <button onClick={() => setTab(0)} style={{ padding: "10px 24px", fontSize: 14, fontWeight: 500, cursor: "pointer", background: "var(--color-background-info)", color: "var(--color-text-info)", border: "0.5px solid var(--color-border-info)", borderRadius: "var(--border-radius-md)" }}>Mizan Yukle</button>
+      </div>)}
+      </div>
+
+      {/* ── Mobil alt navigasyon ── */}
+      {isMobile && (
+        <nav style={{ position: "fixed", left: 0, right: 0, bottom: 0, zIndex: 60, display: "grid", gridTemplateColumns: "repeat(5, 1fr)", borderTop: "0.5px solid var(--color-border-tertiary)", paddingBottom: "env(safe-area-inset-bottom)", ...barStyle }}>
+          {TAB_GROUPS.map((gr) => {
+            const active = gr === activeGroup;
+            const disabled = gr.tabs[0] !== 0 && !hasData;
+            return (
+              <button key={gr.grp} data-group={gr.tabs.join(",")} disabled={disabled} onClick={() => setTab(lastInGroup[gr.grp] != null ? lastInGroup[gr.grp] : gr.tabs[0])} style={{ background: "none", border: "none", padding: "7px 0 6px", display: "flex", flexDirection: "column", alignItems: "center", gap: 3, cursor: disabled ? "default" : "pointer", color: active ? "var(--color-text-info)" : "var(--color-text-secondary)", opacity: disabled ? 0.38 : 1, fontSize: 10.5, fontWeight: active ? 650 : 500, fontFamily: "inherit" }}>
+                <span style={{ width: 48, height: 28, borderRadius: 14, display: "flex", alignItems: "center", justifyContent: "center", background: active ? "var(--color-background-info)" : "transparent", transition: "background 0.2s" }}>
+                  <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={active ? 2 : 1.7} strokeLinecap="round" strokeLinejoin="round" dangerouslySetInnerHTML={{ __html: NAV_ICONS[gr.grp] }} />
+                </span>
+                {gr.grp}
+              </button>
+            );
+          })}
+        </nav>
+      )}
     </div>
   );
 }
