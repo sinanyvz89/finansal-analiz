@@ -997,7 +997,9 @@ export default function App() {
   useEffect(() => {
     let alive = true;
     (async () => {
-      const saved = await idbGet("mizanlar");
+      const raw = await idbGet("mizanlar");
+      // Bozuk veya eski bicimli kayitlari ele (uygulamayi cokertmesin)
+      const saved = Array.isArray(raw) ? raw.filter((m) => m && Array.isArray(m.rows) && m.rows.every((r) => r && typeof r.kod === "string")) : null;
       const st = (await idbGet("ayarlar")) || {};
       if (!alive) return;
       if (Array.isArray(saved) && saved.length) {
