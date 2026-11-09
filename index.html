@@ -60,10 +60,20 @@
       };
       try { var q = indexedDB.deleteDatabase('finanaliz'); q.onsuccess = q.onerror = q.onblocked = adim2; } catch (e) { adim2(); }
     }
-    // 6 saniye icinde uygulama cizilmediyse yardim kutusunu goster
+    // 6 saniye icinde uygulama cizilmediyse: once eski kopyayi (service worker + onbellek) kendiliginden
+    // temizleyip bir kez yeniden yukle (kayitli mizanlar korunur); yine olmazsa yardim kutusunu goster
     setTimeout(function () {
       var r = document.getElementById('root');
       if (r && !r.children.length) {
+        var denendi = false;
+        try { denendi = sessionStorage.getItem('fa-onarim') === '1'; sessionStorage.setItem('fa-onarim', '1'); } catch (e) { denendi = true; }
+        if (!denendi) {
+          var p = [];
+          try { if (window.caches) p.push(caches.keys().then(function (ks) { return Promise.all(ks.map(function (k) { return caches.delete(k); })); })); } catch (e) {}
+          try { if (navigator.serviceWorker) p.push(navigator.serviceWorker.getRegistrations().then(function (rs) { return Promise.all(rs.map(function (x) { return x.unregister(); })); })); } catch (e) {}
+          Promise.all(p).then(function () { location.reload(); }, function () { location.reload(); });
+          return;
+        }
         document.getElementById('fa-yedek').style.display = 'block';
         document.getElementById('fa-hata').textContent = window.__faHatalar.slice(0, 5).join('\n');
       }

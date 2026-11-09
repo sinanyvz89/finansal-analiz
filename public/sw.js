@@ -2,7 +2,7 @@
    - Sayfa (HTML): once ag, ag yoksa onbellek -> internet olmadan da acilir
    - JS/CSS/ikonlar: once onbellek (Vite dosya adlari surum icerir, guvenli)
    Yeni surum yayinlandiginda CACHE adini degistirmek yeterli. */
-const CACHE = 'finanaliz-v6';
+const CACHE = 'finanaliz-v7';
 const CORE = ['/', '/index.html', '/manifest.json', '/icon-192.png', '/icon-512.png', '/apple-touch-icon.png'];
 
 self.addEventListener('install', (e) => {
